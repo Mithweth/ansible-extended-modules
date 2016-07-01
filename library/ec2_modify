@@ -1,0 +1,413 @@
+#!/usr/bin/python
+
+import os, sys, json, time
+from ansible.module_utils.basic import AnsibleModule
+import boto3
+import botocore
+
+"""
+Create a new instance with an image created from the previous instance
+The previous instance and image are deleted if the creation process is successful
+As, you cannot "move" instances over AZ and/or subnets, the deletion and re-creation is the only way.
+Usage:
+  - create_instance(Arguments=dict(),FromInstance=<instance>)
+Parameters:
+  - instance : ec2.Instance object to migrate
+  - dict() : {'keypair':'', 'security_groups':'', 'instance_type': '', 'availability_zone': '', 'subnet': '', 'private_ip_address', ''}
+    N.B.: the 'private_ip_address' value is optional and cannot be used only on migrate in the same subnet
+Returns:
+  - successfully migration ec2.Instance object
+""" 
+def create_instance(**args):
+    global ec2
+    global elapsed
+    global param_timeout
+    if ec2 is None:
+        raise Exception ("Connection to Amazon not opened")
+    if 'Arguments' not in args:
+        raise Exception ("No 'Arguments' parameter found")
+    if 'FromInstance' in args:
+        from_instance_id = args['FromInstance'].id
+    elif 'FromInstanceId' in args:
+        from_instance_id = args['FromInstanceId']
+    else:
+        raise Exception ("No 'FromInstance' or 'FromInstanceId' parameter found")
+    from_instance = ec2.Instance(from_instance_id)
+    if from_instance.state['Name'] == 'running':
+        try:
+            from_instance.stop()
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        from_instance = ec2.Instance(from_instance.id)
+        while from_instance.state['Name'] != 'stopped':
+            time.sleep(2) ; elapsed += 2
+            if elapsed > param_timeout:
+                module.fail_json(changed=False, msg="Timeout exceeded")
+            from_instance = ec2.Instance(from_instance.id)
+    image = from_instance.create_image(Name='ansible-image_'+ str(time.time()))
+    while image.state != "available":
+        time.sleep(2) ; elapsed += 2
+        if elapsed > param_timeout:
+            module.fail_json(changed=False, msg="Timeout exceeded")
+        image = ec2.Image(image.id)
+    monitoring = False if from_instance.monitoring['State'] == 'disabled' else True
+    try:
+        response = from_instance.terminate()
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+        module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'terminate' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+    from_instance = ec2.Instance(from_instance_id)
+    while from_instance.state['Name'] != 'terminated':
+        time.sleep(2) ; elapsed += 2
+        if elapsed > param_timeout:
+            module.fail_json(changed=False, msg="Timeout exceeded")
+        from_instance = ec2.Instance(from_instance_id)
+    try:
+        if 'private_ip_address' in args['Arguments']:
+            new_instances = ec2.create_instances(ImageId=image.id, MinCount=1, MaxCount=1,
+                KeyName=args['Arguments']['keypair'], SecurityGroupIds=args['Arguments']['security_groups'],
+                InstanceType=args['Arguments']['instance_type'], Placement={'AvailabilityZone': args['Arguments']['availability_zone']},
+                Monitoring={'Enabled': monitoring}, SubnetId=args['Arguments']['subnet'],
+                PrivateIpAddress=args['Arguments']['private_ip_address'])
+        else:
+            new_instances = ec2.create_instances(ImageId=image.id, MinCount=1, MaxCount=1,
+                KeyName=args['Arguments']['keypair'], SecurityGroupIds=args['Arguments']['security_groups'],
+                InstanceType=args['Arguments']['instance_type'], Placement={'AvailabilityZone': args['Arguments']['availability_zone']},
+                Monitoring={'Enabled': monitoring}, SubnetId=args['Arguments']['subnet'])
+    except botocore.exceptions.ClientError as err:
+        image.deregister()
+        module.fail_json(changed=False, msg=str(err))
+    to_instance = new_instances[0]
+    while to_instance.state['Name'] != "running":
+        time.sleep(2) ; elapsed += 2
+        if elapsed > param_timeout:
+            module.fail_json(changed=False, msg="Timeout exceeded")
+        to_instance = ec2.Instance(to_instance.id)
+    try:
+        if 'tags' in args['Arguments']:
+            to_instance.create_tags(Tags=args['Arguments']['tags'])
+    except botocore.exceptions.ClientError as err:
+        image.deregister()
+        to_instance.terminate()
+        module.fail_json(changed=False, msg=str(err))
+    try:
+        response = image.deregister()
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+        module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'deregister_images' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+    return to_instance        
+
+"""
+Prettify the ec2.Instance object variables so that module returns the same keys as ec2 module
+Usage:
+  - serialize_instances(instance)
+Parameters:
+  - instance : ec2.Instance object to prettify
+Returns:
+  - ec2.Instance variables dictionary
+"""
+def serialize_instances(instance):
+    return_values = { 
+    'private_dns_name': instance.private_dns_name,
+    'public_dns_name': instance.public_dns_name,
+    'public_ip': instance.public_ip_address,
+    'private_ip': instance.private_ip_address,
+    'id': instance.id,
+    'ebs_optimized': instance.ebs_optimized,
+    'state': instance.state['Name'],
+    'state_code': instance.state['Code'],
+    'virtualization_type': instance.virtualization_type,
+    'architecture': instance.architecture,
+    'ramdisk': instance.ramdisk_id,
+    'key_name': instance.key_pair.name,
+    'vpc_subnet_id': instance.subnet.id,
+    'placement': instance.placement['AvailabilityZone'],
+    'launch_time': instance.launch_time.strftime('%Y-%m-%dT%H:%M:%S'),
+    'instance_type': instance.instance_type,
+    'root_device_name': instance.root_device_name,
+    'hypervisor': instance.hypervisor
+     }
+    disks={}
+    for block_device_mapping in instance.block_device_mappings:
+        disk_stat = {
+            'status': block_device_mapping['Ebs']['Status'],
+            'delete_on_termination': block_device_mapping['Ebs']['DeleteOnTermination'],
+            'volume_id': block_device_mapping['Ebs']['VolumeId']
+        }
+        disks[block_device_mapping['DeviceName']] = disk_stat
+    return_values['block_device_mapping'] = disks
+    groups={}
+    for sg in instance.security_groups:
+        groups[sg['GroupName']] = sg['GroupId']
+    return_values['groups'] = groups
+    tags={}
+    for tag in instance.tags:
+        tags[tag['Key']] = tag['Value']
+    return_values['tags'] = tags
+    return return_values
+
+"""
+Default values
+"""
+aws_regions=[
+		'us-east-1',
+		'us-west-2',
+		'us-west-1',
+		'eu-west-1',
+		'eu-central-1',
+		'ap-southeast-1',
+		'ap-northeast-1',
+		'ap-southeast-2',
+		'ap-northeast-2',
+		'sa-east-1']
+aws_instances = [
+			't2.nano', 't2.micro', 't2.small', 't2.medium', 't2.large', 
+			'm4.large', 'm4.xlarge', 'm4.2xlarge', 'm4.4xlarge', 'm4.10xlarge',
+			'm3.medium', 'm3.large', 'm3.xlarge', 'm3.2xlarge', 'x1.32xlarge',
+			'c4.large', 'c4.xlarge', 'c4.2xlarge', 'c4.4xlarge', 'c4.8xlarge',
+			'c3.large', 'c3.xlarge', 'c3.2xlarge', 'c3.4xlarge', 'c3.8xlarge',
+			'r3.large', 'r3.xlarge', 'r3.2xlarge', 'r3.4xlarge', 'r3.8xlarge',
+			'i2.xlarge', 'i2.2xlarge', 'i2.4xlarge', 'i2.8xlarge', 'd2.xlarge',
+			'd2.2xlarge', 'd2.4xlarge', 'd2.8xlarge', 'g2.2xlarge', 'g2.8xlarge']
+
+"""
+Main
+"""
+
+"""
+Module definition
+"""
+module = AnsibleModule(argument_spec = dict(
+        region = dict(required=False, choices=aws_regions),
+      	access_key = dict(required=False, no_log=True),
+      	secret_key = dict(required=False, no_log=True),
+        ssh_key = dict(required=False, aliases=['key_pair', 'key_name']),
+      	instance_id = dict(required=True, aliases=['instance']),
+        instance_tags = dict(required=False, aliases=['tags'], type='dict'),
+      	instance_type = dict(required=False, choices=aws_instances),
+      	zone = dict(required=False, aliases=['availability_zone', 'placement']),
+      	security_groups = dict(required=False, type='list', aliases=['security_group_id', 'security_group', 'security_group_ids', 'group_id']),
+      	subnet_id = dict(required=False, aliases=['subnet', 'vpc_subnet_id']),
+      	state = dict(required=False, default='running', choices=['running', 'stopped']),
+      	timeout = dict(required=False, default=300, type='int'),
+        wait = dict(required=False, default=False, type='bool'),
+    ))
+
+param_region = module.params.get('region')
+param_access_key = module.params.get('access_key')
+param_secret_key = module.params.get('secret_key')
+param_instance_id = module.params.get('instance_id')
+param_instance_type = module.params.get('instance_type')
+param_key_pair = module.params.get('ssh_key')
+param_zone = module.params.get('zone')
+param_sgs = module.params.get('security_groups')
+param_subnet_id = module.params.get('subnet_id')
+param_instance_tags = module.params.get('instance_tags')
+param_state = module.params.get('state')
+param_timeout = module.params.get('timeout')
+param_wait = module.params.get('wait')
+elapsed = 0
+
+if param_region is None:
+    param_region = os.environ.get("EC2_REGION")
+
+if param_access_key is None:
+    param_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+
+if param_secret_key is None:
+    param_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+"""
+Set ec2 variables
+"""
+session = boto3.session.Session(region_name=param_region, aws_access_key_id=param_access_key, aws_secret_access_key=param_secret_key)
+client = session.client('ec2')
+ec2 = session.resource('ec2')
+
+try:
+    instance = ec2.Instance(param_instance_id)
+except botocore.exceptions.ClientError as err:
+    module.fail_json(changed=False, msg=str(err))
+
+"""
+Change subnet (same AvailabilityZone)
+- if security groups are specified in the module call, use those groups
+- otherwise, among all the available security groups, select one with the same VPC ID as the new subnet.
+NB: The private IP address will not be kept
+"""
+if param_subnet_id is not None and param_zone is None and instance.subnet.id != param_subnet_id:
+    subnet = ec2.Subnet(param_subnet_id)
+    groups = []
+    if param_sgs is not None:
+        for sg in param_sgs:
+            groups.append(sg)
+    else:
+        for security_group in instance.security_groups:
+            sg = ec2.SecurityGroup(security_group['GroupId'])
+            if subnet.vpc_id == sg.vpc_id:
+                groups.append(sg.id)
+        if len(groups) == 0:
+            for sg in ec2.security_groups.all():
+                if subnet.vpc_id == sg.vpc_id:
+                    groups.append(sg.id)
+                    break
+    instance_args = dict(instance_type=instance.instance_type,
+                        availability_zone=subnet.availability_zone,
+                        subnet=subnet.id,
+                        tags = instance.tags,
+                        keypair=instance.key_pair.name,
+                        security_groups=groups)
+    instance = create_instance(Arguments=instance_args, FromInstance=instance)
+
+"""
+Change AvailabilityZone
+- if a subnet is specified in the module call, use it.
+- otherwise, try to use the subnet of the current instance.
+However, check that the subnet is present in the new AvailabilityZone.
+If not, choose one subnet in the new AvailabilityZone.
+- Then, if security groups are specified in the module call, use those groups
+- otherwise, among all the available security groups, select one with the same VPC ID as the chosen subnet.
+NB: The private IP address will not be kept 
+"""
+if param_zone is not None and instance.placement['AvailabilityZone'] != param_zone:
+    if param_subnet_id is None:
+        subnet = ec2.Subnet(instance.subnet.id)
+    else:
+        subnet = ec2.Subnet(param_subnet_id)
+    if subnet.availability_zone != param_zone:
+        for subnet in ec2.subnets.all():
+            if subnet.availability_zone == param_zone: break
+        if subnet.availability_zone != param_zone:
+            module.fail_json(changed=False, msg="No subnet detection in AvailabilityZone %s" % param_zone)
+    groups = []
+    if param_sgs is not None:
+        for sg in param_sgs:
+            groups.append(sg)
+    else:
+        for security_group in instance.security_groups:
+            sg = ec2.SecurityGroup(security_group['GroupId'])
+            if subnet.vpc_id == sg.vpc_id:
+                groups.append(sg.id)
+        if len(groups) == 0:
+            for sg in ec2.security_groups.all():
+                if subnet.vpc_id == sg.vpc_id:
+                    groups.append(sg.id)
+                    break
+    instance_args = dict(instance_type=instance.instance_type,
+                        availability_zone=param_zone,
+                        subnet=subnet.id,
+                        tags = instance.tags,
+                        keypair=instance.key_pair.name,
+                        security_groups=groups)
+    instance = create_instance(Arguments=instance_args, FromInstance=instance)
+
+"""
+Change SecurityGroups
+"""
+if param_sgs is not None and param_zone is None and param_subnet_id is None:
+    if instance.state['Name'] == 'running':
+        try:
+            instance.stop()
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        instance = ec2.Instance(instance.id)
+        while instance.state['Name'] != 'stopped':
+            time.sleep(2) ; elapsed += 2
+            if elapsed > param_timeout:
+                module.fail_json(changed=False, msg="Timeout exceeded")
+            instance = ec2.Instance(instance.id)
+    try:
+        response = client.modify_instance_attribute(InstanceId=instance.id, Groups=param_sgs)
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+        module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+
+"""
+Change InstanceType
+"""
+if param_instance_type is not None and instance.instance_type != param_instance_type:
+    if instance.state['Name'] == 'running':
+        try:
+            instance.stop()
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        instance = ec2.Instance(instance.id)
+        while instance.state['Name'] != 'stopped':
+            time.sleep(2) ; elapsed += 2
+            if elapsed > param_timeout:
+                module.fail_json(changed=False, msg="Timeout exceeded")
+            instance = ec2.Instance(instance.id)
+    try:
+        response = client.modify_instance_attribute(InstanceId=instance.id, InstanceType={'Value': param_instance_type})
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+        module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+
+"""
+Change Tags
+"""
+if param_instance_tags is not None:
+    tag_array=[]
+    for key,val in param_instance_tags.iteritems():
+        tag_array.append({'Key': key, 'Value':val})
+    try:
+        instance.create_tags(Tags=tag_array)
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+
+"""
+Change SSH Key Pair
+The private IP address will be kept
+"""
+if param_key_pair is not None and (instance.key_pair is None or instance.key_pair.name != param_key_pair):
+    groups = []
+    for sg in instance.security_groups:
+        groups.append(sg['GroupId'])
+    instance_args = dict(instance_type=instance.instance_type,
+                        availability_zone=instance.placement['AvailabilityZone'],
+                        subnet=instance.subnet.id,
+                        private_ip_address = instance.private_ip_address,
+                        tags = instance.tags,
+                        keypair=param_key_pair,
+                        security_groups=groups)
+    instance = create_instance(Arguments=instance_args, FromInstance=instance)
+
+"""
+Start the instance if stopped
+If the 'wait' parameter is set to True, the module will hang until availability
+"""
+if param_state == 'running' and instance.state['Name'] != "running":
+    try:
+        instance.start()
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+    if param_wait == True:
+        instance = ec2.Instance(instance.id)
+        while instance.state['Name'] != 'running':
+            time.sleep(2) ; elapsed += 2
+            if elapsed > param_timeout:
+                module.fail_json(changed=False, msg="Timeout exceeded")
+            instance = ec2.Instance(instance.id)
+
+"""
+Stop the instance if running
+If the 'wait' parameter is set to True, the module will hang until unavailability
+"""
+if param_state == 'stopped' and instance.state['Name'] != "stopped":
+    try:
+        instance.stop()
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
+    if param_wait == True:
+        instance = ec2.Instance(instance.id)
+        while instance.state['Name'] != 'stopped':
+            time.sleep(2) ; elapsed += 2
+            if elapsed > param_timeout:
+                module.fail_json(changed=False, msg="Timeout exceeded")
+            instance = ec2.Instance(instance.id)
+
+module.exit_json(changed=True, instance_ids=[instance.id], instances=[serialize_instances(instance)])
