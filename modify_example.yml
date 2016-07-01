@@ -1,0 +1,28 @@
+---
+- name: Modify Amazon EC2 instances
+  hosts: localhost
+  gather_facts: False
+  tasks:
+    - ec2:
+        image: ami-abababab
+        instance_type: t2.micro
+        region: eu-west-1b
+        key_name: foo
+        zone: eu-west-1b
+        vpc_subnet_id: subnet-xxxxx
+        wait: true
+      register: vm_detail
+
+    - set_fact:
+        instance_id: "{{ item.id }}"
+      with_items: "{{ vm_detail.instances | default([]) }}"      
+
+    - ec2_modify:
+        instance_id: "{{ instance_id }}"
+        region: eu-west-1
+        key_name: bar
+        zone: eu-west-1a
+      register: vm_modify
+
+    - debug: var=vm_modify
+
