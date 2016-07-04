@@ -15,6 +15,6 @@ This module permits those changes without any data losses.
 
 | parameter      | required    | default | choices | comments             |
 |----------------|-------------|---------|---------|----------------------|
-| aws_access_key | no          |         |         | AWS access key. If not set then the value of the AWS_ACCESS_KEY_ID, AWS_ACCESS_KEY or EC2_ACCESS_KEY environment variable is used.<p style="font-size:small;">aliases: access_key</p> |
+| aws_access_key | no          |         |         | <div>AWS access key. If not set then the value of the AWS_ACCESS_KEY_ID, AWS_ACCESS_KEY or EC2_ACCESS_KEY environment variable is used.</div><br/><div style="font-size:small;">aliases: access_key</div> |
 
 
