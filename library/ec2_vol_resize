@@ -87,7 +87,7 @@ else:
 if volume.size > param_size:
     module.fail_json(changed=False, msg="The 'size' parameter cannot lesser than the current volume size")    
 
-if instance is not None:
+if instance is not None and instance.state['Name'] == 'running':
     try:
         response = instance.stop()
     except botocore.exceptions.ClientError as err:
