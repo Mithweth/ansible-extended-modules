@@ -180,14 +180,14 @@ Main
 Module definition
 """
 module = AnsibleModule(argument_spec = dict(
-        region = dict(required=False, choices=aws_regions),
+        region = dict(required=False, choices=aws_regions, aliases=['aws_region', 'ec2_region']),
         access_key = dict(required=False, no_log=True, aliases=['aws_access_key']),
-        secret_key = dict(required=False, no_log=True, aliases=['aws_secret_key']),
-        ssh_key = dict(required=False, aliases=['key_pair', 'key_name']),
+        secret_key = dict(required=False, no_log=True, aliases=['aws_secret_key', 'ec2_secret_key']),
+        ssh_key = dict(required=False, aliases=['keypair', 'key_name']),
         instance_id = dict(required=True, aliases=['instance']),
         instance_tags = dict(required=False, aliases=['tags'], type='dict'),
         instance_type = dict(required=False, choices=aws_instances),
-        zone = dict(required=False, aliases=['availability_zone', 'placement']),
+        zone = dict(required=False, aliases=['availability_zone', 'placement', 'aws_zone', 'ec2_zone']),
         security_groups = dict(required=False, type='list', aliases=['security_group_id', 'security_group', 'security_group_ids', 'group_id']),
         subnet_id = dict(required=False, aliases=['subnet', 'vpc_subnet_id']),
         state = dict(required=False, default='running', choices=['running', 'stopped']),
@@ -214,10 +214,21 @@ if param_region is None:
     param_region = os.environ.get("EC2_REGION")
 
 if param_access_key is None:
-    param_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    if os.environ.get("AWS_ACCESS_KEY_ID") is not None:
+        param_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    elif os.environ.get("AWS_ACCESS_KEY") is not None:
+        param_access_key = os.environ.get("AWS_ACCESS_KEY")
+    else:
+        param_access_key = os.environ.get("EC2_ACCESS_KEY")
 
 if param_secret_key is None:
-    param_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if os.environ.get("AWS_SECRET_ACCESS_KEY") is not None:
+        param_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    elif os.environ.get("AWS_SECRET_KEY") is not None:
+        param_secret_key = os.environ.get("AWS_SECRET_KEY")
+    else:
+        param_secret_key = os.environ.get("EC2_SECRET_KEY")
+
 
 """
 Set ec2 variables
