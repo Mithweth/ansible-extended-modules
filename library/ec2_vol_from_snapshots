@@ -4,13 +4,6 @@ import os, sys, json, time
 from ansible.module_utils.basic import AnsibleModule
 import boto3
 import botocore
-from datetime import datetime
-
-def json_serial(obj):
-    if isinstance(obj, datetime):
-        serial = obj.isoformat()
-        return serial
-    raise TypeError ("Type not serializable")
 
 aws_regions=[
 		'us-east-1',
@@ -23,96 +16,112 @@ aws_regions=[
 		'ap-southeast-2',
 		'ap-northeast-2',
 		'sa-east-1']
-default_access_key=os.environ.get("AWS_ACCESS_KEY_ID")
-default_secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
-default_region=os.environ.get("EC2_REGION")
 
 module = AnsibleModule(argument_spec = dict(
-        region = dict(required=False, choices=aws_regions, default=default_region),
+        region = dict(required=False, choices=aws_regions, aliases=['aws_region', 'ec2_region']),
         size = dict(required=False, default=40, type='int', aliases=['volume_size']),
-      	access_key = dict(required=False, no_log=True, default=default_access_key),
-      	secret_key = dict(required=False, no_log=True, default=default_secret_key),
-      	snapshot_id = dict(required=True, aliases=['snapshot']),
+        encrypted = dict(required=False, default=False, type='bool'),
+        access_key = dict(required=False, no_log=True, aliases=['aws_access_key']),
+        secret_key = dict(required=False, no_log=True, aliases=['aws_secret_key', 'ec2_secret_key']),
+        snapshot_id = dict(required=True, aliases=['snapshot']),
       	instance_id = dict(required=True, aliases=['instance']),
       	device = dict(required=True, aliases=['device_name']),
       	delete_on_termination = dict(required=False, default=True, type='bool'),
       	timeout = dict(required=False, default=300, type='int'),
+        volume_type = dict(required=False, default='standard', choices=['standard','io1','gp2','sc1','st1']),
     ))
 
-region = module.params.get('region')
-size = module.params.get('size')
-access_key = module.params.get('access_key')
-secret_key = module.params.get('secret_key')
-snapshot_id = module.params.get('snapshot_id')
-instance_id = module.params.get('instance_id')
-device = module.params.get('device')
-delete_on_termination = module.params.get('delete_on_termination')
-timeout = module.params.get('timeout')
+param_region = module.params.get('region')
+param_size = module.params.get('size')
+param_access_key = module.params.get('access_key')
+param_secret_key = module.params.get('secret_key')
+param_snapshot_id = module.params.get('snapshot_id')
+param_instance_id = module.params.get('instance_id')
+param_device = module.params.get('device')
+param_delete_on_termination = module.params.get('delete_on_termination')
+param_timeout = module.params.get('timeout')
+param_volume_type = module.params.get('volume_type')
+param_encrypted = module.params.get('encrypted')
 elapsed = 0
 
-# module.exit_json(changed=True, msg=str(size))
-session = boto3.session.Session(region_name=region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+if param_region is None:
+    param_region = os.environ.get("EC2_REGION")
+
+if param_access_key is None:
+    if os.environ.get("AWS_ACCESS_KEY_ID") is not None:
+        param_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    elif os.environ.get("AWS_ACCESS_KEY") is not None:
+        param_access_key = os.environ.get("AWS_ACCESS_KEY")
+    else:
+        param_access_key = os.environ.get("EC2_ACCESS_KEY")
+
+if param_secret_key is None:
+    if os.environ.get("AWS_SECRET_ACCESS_KEY") is not None:
+        param_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    elif os.environ.get("AWS_SECRET_KEY") is not None:
+        param_secret_key = os.environ.get("AWS_SECRET_KEY")
+    else:
+        param_secret_key = os.environ.get("EC2_SECRET_KEY")
+
+
+"""
+Set ec2 variables
+"""
+session = boto3.session.Session(region_name=param_region, aws_access_key_id=param_access_key, aws_secret_access_key=param_secret_key)
 client = session.client('ec2')
+ec2 = session.resource('ec2')
 
 try:
-    data = client.describe_instances(InstanceIds=[instance_id])
+    instance = ec2.Instance(param_instance_id)
 except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
 
-instance = data['Reservations'][0]['Instances'][0]
-instance_zone = instance['Placement']['AvailabilityZone']
-
 try:
-    volume = client.create_volume(Size=size, SnapshotId=snapshot_id, AvailabilityZone=instance_zone)
+    volume = ec2.create_volume(Size=param_size, SnapshotId=param_snapshot_id, AvailabilityZone=instance.placement['AvailabilityZone'],
+        VolumeType=param_volume_type, Encrypted=param_encrypted)
 except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
 
-if volume['ResponseMetadata']['HTTPStatusCode'] != 200:
-    module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'create_volume' is %d " % volume['ResponseMetadata']['HTTPStatusCode'])
+volume = ec2.Volume(volume.id)
 
-time.sleep(2) ; elapsed += 2
-description = client.describe_volumes(VolumeIds=[volume['VolumeId']])
-if len(description['Volumes']) == 0:
-    client.delete_volume(VolumeId=volume['VolumeId'])
-    module.fail_json(changed=False, msg="Error while volume creation: the volume cannot be reached")
-
-while description['Volumes'][0]['State'] != 'available':
+while volume.state != 'available':
     time.sleep(2) ; elapsed += 2
-    if elapsed > timeout:
-        client.delete_volume(VolumeId=volume['VolumeId'])
+    if elapsed > param_timeout:
+        volume.delete()
         module.fail_json(changed=False, msg="Timeout exceeded")
-    description = client.describe_volumes(VolumeIds=[volume['VolumeId']])
-
+    volume = ec2.Volume(volume.id)
 try:
-    response = client.attach_volume(VolumeId=volume['VolumeId'], InstanceId=instance_id, Device=device)
+    response = instance.attach_volume(VolumeId=volume.id, Device=param_device)
 except botocore.exceptions.ClientError as err:
-    response = client.delete_volume(VolumeId=volume['VolumeId'])
+    volume.delete()
     module.fail_json(changed=False, msg=str(err))
 
-time.sleep(2) ; elapsed += 2
-description = client.describe_volumes(VolumeIds=[volume['VolumeId']])
-if len(description['Volumes']) == 0:
-    client.delete_volume(VolumeId=volume['VolumeId'])
-    module.fail_json(changed=False, msg="Error which volume creation: the volume cannot be reached")
-if len(description['Volumes'][0]['Attachments']) == 0:
-    client.delete_volume(VolumeId=volume['VolumeId'])
-    module.fail_json(changed=False, msg="Error whille volume attachement: the volume cannot be attached")
+if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+    volume.delete()
+    module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
-while description['Volumes'][0]['Attachments'][0]['State'] != 'attached':
+volume = ec2.Volume(volume.id)
+while volume.attachments[0]['State'] != 'attached':
     time.sleep(2) ; elapsed += 2
-    if elapsed > timeout:
-        client.delete_volume(VolumeId=volume['VolumeId'])
+    if elapsed > param_timeout:
+        volume.delete()
         module.fail_json(changed=False, msg="Timeout exceeded")
-    description = client.describe_volumes(VolumeIds=[volume['VolumeId']])
+    volume = ec2.Volume(volume.id)
 
 try:
-    response = client.modify_instance_attribute(InstanceId=instance_id, BlockDeviceMappings=[{
-            'DeviceName': device, 'Ebs': {'VolumeId': volume['VolumeId'], 'DeleteOnTermination': delete_on_termination}
-            }])
+    response = client.modify_instance_attribute(InstanceId=instance.id, BlockDeviceMappings=[{
+            'DeviceName': param_device, 'Ebs': {'VolumeId': volume.id, 'DeleteOnTermination': param_delete_on_termination}}])
 except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
 
 if response['ResponseMetadata']['HTTPStatusCode'] != 200:
     module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
-module.exit_json(changed=True, msg=json.dumps(volume, default=json_serial))
+volume_details={'create_time': volume.create_time, 'encrypted': volume.encrypted, 'id': volume.id, 'iops': volume.iops,
+    'size': volume.size, 'snapshot_id': volume.snapshot_id, 'status': volume.state, 'tags': volume.tags,
+    'type': volume.volume_type, 'zone': volume.availability_zone, 'attachment_set': {
+    'attach_time': volume.attachments[0]['AttachTime'], 'deleteOnTermination': param_delete_on_termination,
+    'device': param_device, 'instance_id': instance.id, 'status': volume.attachments[0]['State']
+    }}
+
+module.exit_json(changed=True, device=param_device, volume_id=volume.id, volume_type=volume.volume_type, volume=volume_details)
