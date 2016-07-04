@@ -181,17 +181,17 @@ Module definition
 """
 module = AnsibleModule(argument_spec = dict(
         region = dict(required=False, choices=aws_regions),
-      	access_key = dict(required=False, no_log=True),
-      	secret_key = dict(required=False, no_log=True),
+        access_key = dict(required=False, no_log=True, aliases=['aws_access_key']),
+        secret_key = dict(required=False, no_log=True, aliases=['aws_secret_key']),
         ssh_key = dict(required=False, aliases=['key_pair', 'key_name']),
-      	instance_id = dict(required=True, aliases=['instance']),
+        instance_id = dict(required=True, aliases=['instance']),
         instance_tags = dict(required=False, aliases=['tags'], type='dict'),
-      	instance_type = dict(required=False, choices=aws_instances),
-      	zone = dict(required=False, aliases=['availability_zone', 'placement']),
-      	security_groups = dict(required=False, type='list', aliases=['security_group_id', 'security_group', 'security_group_ids', 'group_id']),
-      	subnet_id = dict(required=False, aliases=['subnet', 'vpc_subnet_id']),
-      	state = dict(required=False, default='running', choices=['running', 'stopped']),
-      	timeout = dict(required=False, default=300, type='int'),
+        instance_type = dict(required=False, choices=aws_instances),
+        zone = dict(required=False, aliases=['availability_zone', 'placement']),
+        security_groups = dict(required=False, type='list', aliases=['security_group_id', 'security_group', 'security_group_ids', 'group_id']),
+        subnet_id = dict(required=False, aliases=['subnet', 'vpc_subnet_id']),
+        state = dict(required=False, default='running', choices=['running', 'stopped']),
+        timeout = dict(required=False, default=300, type='int'),
         wait = dict(required=False, default=False, type='bool'),
     ))
 
