@@ -29,7 +29,7 @@ This module permits those changes without any data losses.
 | wait           | no          |     no  | <ul><li>yes</li><li>no</li></ul> | wait for the instance to be in the desired state before returning |
 | zone           | no          |         |         | <div>AWS availability zone in which to launch the instance. If no subnet is specified, also change the subnet with one in the new zone. That task will return a new instance id</div><br/><div style="font-size:small;">aliases: availability_zone, placement, aws_zone, ec2_zone</div> |
 
-## Example
+## Examples
 
 ```
 # Note: These examples do not set authentication details, see the AWS Guide for details.
