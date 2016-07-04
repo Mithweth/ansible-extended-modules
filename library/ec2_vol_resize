@@ -70,19 +70,21 @@ ec2 = session.resource('ec2')
 
 instance = None
 volume = None
-if param_device is not None and param_instance_id is not None:
+if param_instance_id is not None:
     try:
         instance = ec2.Instance(param_instance_id)
     except botocore.exceptions.ClientError as err:
         module.fail_json(changed=False, msg=str(err))
+
+if param_volume_id is not None:
+    volume = ec2.Volume(param_volume_id)
+else:
     for vol in instance.volumes.all():
         for attach in vol.attachments:
             if attach['Device'] == param_device:
                 volume = ec2.Volume(vol.id)
                 break
         if volume is not None: break
-else:
-    volume = ec2.Volume(param_volume_id)
 
 if volume.size > param_size:
     module.fail_json(changed=False, msg="The 'size' parameter cannot lesser than the current volume size")    
@@ -187,7 +189,7 @@ if instance is not None:
             module.fail_json(changed=False, msg="Timeout exceeded")
         instance = ec2.Instance(instance.id)
 
-if instance_id is None:
+if instance is None:
     attachments = {}
 else:
     attachments = {'attach_time': new_volume.attachments[0]['AttachTime'],
