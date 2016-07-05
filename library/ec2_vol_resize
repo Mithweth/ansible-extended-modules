@@ -70,6 +70,7 @@ ec2 = session.resource('ec2')
 
 instance = None
 volume = None
+device_name = None
 if param_instance_id is not None:
     try:
         instance = ec2.Instance(param_instance_id)
@@ -78,6 +79,7 @@ if param_instance_id is not None:
 
 """
 Determine if the volume is attached (if so, 'instance' is not None)
+and check parameters
 """
 if param_volume_id is not None:
     volume = ec2.Volume(param_volume_id)
@@ -90,9 +92,10 @@ if param_volume_id is not None:
         else:
             for attach in volume.attachments:
                 if instance.id == attach['InstanceId']: break
-            module.fail_json(changed=False, msg="The volume with 'volume_id' %s does not belong to the instance %s" % (volume.id, instance.id))
+            if instance.id != attach['InstanceId']:
+                module.fail_json(changed=False, msg="The volume with 'volume_id' %s does not belong to the instance %s" % (volume.id, instance.id))
 else:
-    if instance is not None:
+    if instance is not None and param_device is not None:
         for vol in instance.volumes.all():
             for attach in vol.attachments:
                 if attach['Device'] == param_device:
@@ -141,6 +144,7 @@ while new_volume.state != 'available':
     time.sleep(2) ; elapsed += 2
     if elapsed > param_timeout:
         new_volume.delete()
+        client.delete_snapshot(SnapshotId=snapshot.id)
         module.fail_json(changed=False, msg="Timeout exceeded")
     new_volume = ec2.Volume(new_volume.id)
 try:
@@ -149,14 +153,22 @@ except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
 
 """
-Detach volume from instance if attached
+If attached instance exists :
+- Detach volume from instance
+- Attach new volume to instance
+- Set delete_on_termination flag
 """
 if instance is not None:
     delete_on_termination = volume.attachments[0]['DeleteOnTermination']
+    for attach in volume.attachments:
+        if attach['InstanceId'] == instance.id:
+            device_name = attach['Device']
+            break
     try:
-        response = instance.detach_volume(VolumeId=volume.id, Device=param_device)
+        response = instance.detach_volume(VolumeId=volume.id)
     except botocore.exceptions.ClientError as err:
         new_volume.delete()
+        client.delete_snapshot(SnapshotId=snapshot.id)
         module.fail_json(changed=False, msg=str(err))
     if response['ResponseMetadata']['HTTPStatusCode'] != 200:
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'detach_volume' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
@@ -166,19 +178,19 @@ if instance is not None:
         time.sleep(2) ; elapsed += 2
         if elapsed > param_timeout:
             new_volume.delete()
+            client.delete_snapshot(SnapshotId=snapshot.id)
             module.fail_json(changed=False, msg="Timeout exceeded")
         volume = ec2.Volume(volume.id)
-
-"""
-Attach new volume to instance and set delete_on_termination flag if exists
-"""
+    
     try:
-        response = instance.attach_volume(VolumeId=new_volume.id, Device=param_device)
+        response = instance.attach_volume(VolumeId=new_volume.id, Device=device_name)
     except botocore.exceptions.ClientError as err:
         new_volume.delete()
+        client.delete_snapshot(SnapshotId=snapshot.id)
         module.fail_json(changed=False, msg=str(err))
     if response['ResponseMetadata']['HTTPStatusCode'] != 200:
         new_volume.delete()
+        client.delete_snapshot(SnapshotId=snapshot.id)
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'attach_volume' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
     new_volume = ec2.Volume(new_volume.id)
@@ -186,12 +198,13 @@ Attach new volume to instance and set delete_on_termination flag if exists
         time.sleep(2) ; elapsed += 2
         if elapsed > param_timeout:
             new_volume.delete()
+            client.delete_snapshot(SnapshotId=snapshot.id)
             module.fail_json(changed=False, msg="Timeout exceeded")
         new_volume = ec2.Volume(new_volume.id)
 
     try:
         response = client.modify_instance_attribute(InstanceId=instance.id, BlockDeviceMappings=[{
-                'DeviceName': param_device, 'Ebs': {'VolumeId': volume.id, 'DeleteOnTermination': delete_on_termination}}])
+                'DeviceName': device_name, 'Ebs': {'VolumeId': volume.id, 'DeleteOnTermination': delete_on_termination}}])
     except botocore.exceptions.ClientError as err:
         module.fail_json(changed=False, msg=str(err))
 
@@ -207,6 +220,16 @@ except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
 if response['ResponseMetadata']['HTTPStatusCode'] != 200:
     module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'delete_snapshot' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+
+"""
+Delete initial volume
+"""
+try:
+    response = volume.delete()
+except botocore.exceptions.ClientError as err:
+    module.fail_json(changed=False, msg=str(err))
+if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+    module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'delete_volume' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
 """
 Restart instance if exists
@@ -229,10 +252,10 @@ if instance is None:
 else:
     attachments = {'attach_time': new_volume.attachments[0]['AttachTime'],
     'deleteOnTermination': delete_on_termination,
-    'device': param_device, 'instance_id': instance.id, 'status': new_volume.attachments[0]['State']}
+    'device': device_name, 'instance_id': instance.id, 'status': new_volume.attachments[0]['State']}
 
 volume_details={'create_time': new_volume.create_time, 'encrypted': new_volume.encrypted, 'id': new_volume.id, 'iops': new_volume.iops,
     'size': new_volume.size, 'snapshot_id': new_volume.snapshot_id, 'status': new_volume.state, 'tags': new_volume.tags,
     'type': new_volume.volume_type, 'zone': new_volume.availability_zone, 'attachment_set': attachments}
 
-module.exit_json(changed=True, device=param_device, volume_id=new_volume.id, volume_type=new_volume.volume_type, volume=volume_details)
+module.exit_json(changed=True, device=device_name, volume_id=new_volume.id, volume_type=new_volume.volume_type, volume=volume_details)
