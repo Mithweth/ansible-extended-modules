@@ -43,9 +43,9 @@ It also correct the "Cannot specify volume_size and either one of name or id" bu
     - ec2_vol_facts:
         filters:
           volume-id: "{{ volume_id }}"
-      register: volume
+      register: aws_vol
     - set_fact: size={{ item.size + 20 }}
-      with_items: "{{ volume.volume }}"
+      with_items: "{{ aws_vol.volumes }}"
     - ec2_vol_resize:
         volume_id: "{{ volume_id }}"
         size: "{{ size }}"

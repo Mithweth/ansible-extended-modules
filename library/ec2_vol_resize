@@ -147,10 +147,11 @@ while new_volume.state != 'available':
         client.delete_snapshot(SnapshotId=snapshot.id)
         module.fail_json(changed=False, msg="Timeout exceeded")
     new_volume = ec2.Volume(new_volume.id)
-try:
-    new_volume.create_tags(Tags=volume.tags)
-except botocore.exceptions.ClientError as err:
-    module.fail_json(changed=False, msg=str(err))
+if volume.tags is not None:
+    try:
+        new_volume.create_tags(Tags=volume.tags)
+    except botocore.exceptions.ClientError as err:
+        module.fail_json(changed=False, msg=str(err))
 
 """
 If attached instance exists :
