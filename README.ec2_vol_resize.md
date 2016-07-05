@@ -38,7 +38,7 @@ It also correct the "Cannot specify volume_size and either one of name or id" bu
 - hosts: localhost
   gather_facts: False
   vars:
-    volume_id: vol_foobar
+    volume_id: vol-foobar
   tasks:
     - ec2_vol_facts:
         filters:
