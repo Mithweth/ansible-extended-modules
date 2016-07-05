@@ -35,15 +35,20 @@ It also correct the "Cannot specify volume_size and either one of name or id" bu
     device_name: /dev/sda1
 
 # Increase the size of a given drive by 20GB
-- ec2_vol_facts:
-    filters:
-      volume-id: vol-foobar
-  register: volume
-- set_fact: size={{ item.size + 20 }}
-  with_items: "{{ volume.volume }}"
-- ec2_vol_resize:
-    volume_id: vol-foobar
-    size: "{{ size }}"
+- hosts: localhost
+  gather_facts: False
+  vars:
+    volume_id: vol_foobar
+  tasks:
+    - ec2_vol_facts:
+        filters:
+          volume-id: "{{ volume_id }}"
+      register: volume
+    - set_fact: size={{ item.size + 20 }}
+      with_items: "{{ volume.volume }}"
+    - ec2_vol_resize:
+        volume_id: "{{ volume_id }}"
+        size: "{{ size }}"
 ```
 
 ## Notes
