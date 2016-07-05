@@ -76,19 +76,36 @@ if param_instance_id is not None:
     except botocore.exceptions.ClientError as err:
         module.fail_json(changed=False, msg=str(err))
 
+"""
+Determine if the volume is attached (if so, 'instance' is not None)
+"""
 if param_volume_id is not None:
     volume = ec2.Volume(param_volume_id)
+    if len(volume.attachments) > 0:
+        if instance is None:
+            try:
+                instance = ec2.Instance(volume.attachments[0]['InstanceId'])
+            except botocore.exceptions.ClientError as err:
+                module.fail_json(changed=False, msg=str(err))
+        else:
+            for attach in volume.attachments:
+                if instance.id == attach['InstanceId']: break
+            module.fail_json(changed=False, msg="The volume with 'volume_id' %s does not belong to the instance %s" % (volume.id, instance.id))
 else:
-    for vol in instance.volumes.all():
-        for attach in vol.attachments:
-            if attach['Device'] == param_device:
-                volume = ec2.Volume(vol.id)
-                break
-        if volume is not None: break
+    if instance is not None:
+        for vol in instance.volumes.all():
+            for attach in vol.attachments:
+                if attach['Device'] == param_device:
+                    volume = ec2.Volume(vol.id)
+                    break
+            if volume is not None: break
 
 if volume.size > param_size:
     module.fail_json(changed=False, msg="The 'size' parameter cannot lesser than the current volume size")    
 
+"""
+Stop instance if attached and running
+"""
 if instance is not None and instance.state['Name'] == 'running':
     try:
         response = instance.stop()
@@ -112,6 +129,9 @@ while snapshot.state != 'completed':
         module.fail_json(changed=False, msg="Timeout exceeded")
     snapshot = ec2.Snapshot(snapshot.id)
 
+"""
+Create new volume from previous volume snapshot
+"""
 try:
     new_volume = ec2.create_volume(Size=param_size, SnapshotId=snapshot.id, AvailabilityZone=volume.availability_zone,
         VolumeType=volume.volume_type, Encrypted=volume.encrypted)
@@ -123,7 +143,14 @@ while new_volume.state != 'available':
         new_volume.delete()
         module.fail_json(changed=False, msg="Timeout exceeded")
     new_volume = ec2.Volume(new_volume.id)
+try:
+    new_volume.create_tags(Tags=volume.tags)
+except botocore.exceptions.ClientError as err:
+    module.fail_json(changed=False, msg=str(err))
 
+"""
+Detach volume from instance if attached
+"""
 if instance is not None:
     delete_on_termination = volume.attachments[0]['DeleteOnTermination']
     try:
@@ -142,6 +169,9 @@ if instance is not None:
             module.fail_json(changed=False, msg="Timeout exceeded")
         volume = ec2.Volume(volume.id)
 
+"""
+Attach new volume to instance and set delete_on_termination flag if exists
+"""
     try:
         response = instance.attach_volume(VolumeId=new_volume.id, Device=param_device)
     except botocore.exceptions.ClientError as err:
@@ -168,14 +198,19 @@ if instance is not None:
     if response['ResponseMetadata']['HTTPStatusCode'] != 200:
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
+"""
+Delete snapshot
+"""
 try:
     response = client.delete_snapshot(SnapshotId=snapshot.id)
 except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
-
 if response['ResponseMetadata']['HTTPStatusCode'] != 200:
     module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'delete_snapshot' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
+"""
+Restart instance if exists
+"""
 if instance is not None:
     try:
         response = instance.start()
@@ -193,7 +228,7 @@ if instance is None:
     attachments = {}
 else:
     attachments = {'attach_time': new_volume.attachments[0]['AttachTime'],
-    'deleteOnTermination': new_volume.attachments[0]['DeleteOnTermination'],
+    'deleteOnTermination': delete_on_termination,
     'device': param_device, 'instance_id': instance.id, 'status': new_volume.attachments[0]['State']}
 
 volume_details={'create_time': new_volume.create_time, 'encrypted': new_volume.encrypted, 'id': new_volume.id, 'iops': new_volume.iops,
