@@ -90,18 +90,13 @@ if param_volume_id is not None:
             except botocore.exceptions.ClientError as err:
                 module.fail_json(changed=False, msg=str(err))
         else:
-            for attach in volume.attachments:
-                if instance.id == attach['InstanceId']: break
-            if instance.id != attach['InstanceId']:
+            if not [attach['InstanceId'] for attach in volume.attachments if instance.id == attach['InstanceId']]:
                 module.fail_json(changed=False, msg="The volume with 'volume_id' %s does not belong to the instance %s" % (volume.id, instance.id))
 else:
     if instance is not None and param_device is not None:
-        for vol in instance.volumes.all():
-            for attach in vol.attachments:
-                if attach['Device'] == param_device:
-                    volume = ec2.Volume(vol.id)
-                    break
-            if volume is not None: break
+        for volume in [vol for vol in instance.volumes.all() for attach in vol.attachments if attach['Device'] == param_device]: break
+        if volume is None:
+            module.fail_json(changed=False, msg="The device %s does not belong to the instance %s" % (param_device, instance.id))
 
 if volume.size > param_size:
     module.fail_json(changed=False, msg="The 'size' parameter cannot lesser than the current volume size")    
@@ -147,11 +142,10 @@ while new_volume.state != 'available':
         client.delete_snapshot(SnapshotId=snapshot.id)
         module.fail_json(changed=False, msg="Timeout exceeded")
     new_volume = ec2.Volume(new_volume.id)
-if volume.tags is not None:
-    try:
-        new_volume.create_tags(Tags=volume.tags)
-    except botocore.exceptions.ClientError as err:
-        module.fail_json(changed=False, msg=str(err))
+try:
+    new_volume.create_tags(Tags=volume.tags)
+except botocore.exceptions.ClientError as err:
+    module.fail_json(changed=False, msg=str(err))
 
 """
 If attached instance exists :
@@ -161,10 +155,8 @@ If attached instance exists :
 """
 if instance is not None:
     delete_on_termination = volume.attachments[0]['DeleteOnTermination']
-    for attach in volume.attachments:
-        if attach['InstanceId'] == instance.id:
-            device_name = attach['Device']
-            break
+    for device_name in [attach['Device'] for attach in volume.attachments if instance.id == attach['InstanceId']]: break
+
     try:
         response = instance.detach_volume(VolumeId=volume.id)
     except botocore.exceptions.ClientError as err:
