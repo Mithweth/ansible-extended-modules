@@ -6,6 +6,35 @@ import boto3
 import botocore
 
 """
+Timer with timeout
+"""
+def wait_for(seconds):
+    global elapsed
+    global param_timeout
+    time.sleep(seconds) ; elapsed += seconds
+    if elapsed > param_timeout:
+        module.fail_json(changed=False, msg="Timeout exceeded") 
+
+"""
+Wait until the given state changes
+"""
+def wait_until(state, **args):
+    global ec2
+    if ec2 is None:
+        raise Exception("Connection to Amazon not opened")    
+    if 'InstanceId' in args:
+        instance = ec2.Instance(args['InstanceId'])
+        while instance.state['Name'] != state:
+            wait_for(2)
+            instance = ec2.Instance(args['InstanceId'])
+    elif 'ImageId' in args:
+        image = ec2.Image(args['ImageId'])
+        while image.state != state:
+            wait_for(2)
+            image = ec2.Image(args['ImageId'])
+
+
+"""
 Create a new instance with an image created from the previous instance
 The previous instance and image are deleted if the creation process is successful
 As, you cannot "move" instances over AZ and/or subnets, the deletion and re-creation is the only way.
@@ -20,18 +49,16 @@ Returns:
 """ 
 def create_instance(**args):
     global ec2
-    global elapsed
-    global param_timeout
     if ec2 is None:
-        raise Exception ("Connection to Amazon not opened")
+        raise Exception("Connection to Amazon not opened")
     if 'Arguments' not in args:
-        raise Exception ("No 'Arguments' parameter found")
+        raise Exception("No 'Arguments' parameter found")
     if 'FromInstance' in args:
         from_instance_id = args['FromInstance'].id
     elif 'FromInstanceId' in args:
         from_instance_id = args['FromInstanceId']
     else:
-        raise Exception ("No 'FromInstance' or 'FromInstanceId' parameter found")
+        raise Exception("No 'FromInstance' or 'FromInstanceId' parameter found")
     from_instance = ec2.Instance(from_instance_id)
     if from_instance.state['Name'] == 'running':
         try:
@@ -39,17 +66,9 @@ def create_instance(**args):
         except botocore.exceptions.ClientError as err:
             module.fail_json(changed=False, msg=str(err))
         from_instance = ec2.Instance(from_instance.id)
-        while from_instance.state['Name'] != 'stopped':
-            time.sleep(2) ; elapsed += 2
-            if elapsed > param_timeout:
-                module.fail_json(changed=False, msg="Timeout exceeded")
-            from_instance = ec2.Instance(from_instance.id)
+        wait_until('stopped', InstanceId=from_instance_id)
     image = from_instance.create_image(Name='ansible-image_'+ str(time.time()))
-    while image.state != "available":
-        time.sleep(2) ; elapsed += 2
-        if elapsed > param_timeout:
-            module.fail_json(changed=False, msg="Timeout exceeded")
-        image = ec2.Image(image.id)
+    wait_until('available', ImageId=image.id)
     monitoring = False if from_instance.monitoring['State'] == 'disabled' else True
     try:
         response = from_instance.terminate()
@@ -57,12 +76,7 @@ def create_instance(**args):
         module.fail_json(changed=False, msg=str(err))
     if response['ResponseMetadata']['HTTPStatusCode'] != 200:
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'terminate' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
-    from_instance = ec2.Instance(from_instance_id)
-    while from_instance.state['Name'] != 'terminated':
-        time.sleep(2) ; elapsed += 2
-        if elapsed > param_timeout:
-            module.fail_json(changed=False, msg="Timeout exceeded")
-        from_instance = ec2.Instance(from_instance_id)
+    wait_until('terminated', InstanceId=from_instance_id)
     try:
         if 'private_ip_address' in args['Arguments']:
             new_instances = ec2.create_instances(ImageId=image.id, MinCount=1, MaxCount=1,
@@ -79,11 +93,7 @@ def create_instance(**args):
         image.deregister()
         module.fail_json(changed=False, msg=str(err))
     to_instance = new_instances[0]
-    while to_instance.state['Name'] != "running":
-        time.sleep(2) ; elapsed += 2
-        if elapsed > param_timeout:
-            module.fail_json(changed=False, msg="Timeout exceeded")
-        to_instance = ec2.Instance(to_instance.id)
+    wait_until('running', InstanceId=to_instance.id)
     try:
         if 'tags' in args['Arguments']:
             to_instance.create_tags(Tags=args['Arguments']['tags'])
@@ -241,6 +251,8 @@ try:
     instance = ec2.Instance(param_instance_id)
 except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
+if instance.state['Name'] == 'terminated':
+    module.fail_json(changed=False, msg="The instance %s is terminated." % param_instance_id)
 
 """
 Change subnet (same AvailabilityZone)
@@ -323,12 +335,7 @@ if param_sgs is not None and param_zone is None and param_subnet_id is None:
             instance.stop()
         except botocore.exceptions.ClientError as err:
             module.fail_json(changed=False, msg=str(err))
-        instance = ec2.Instance(instance.id)
-        while instance.state['Name'] != 'stopped':
-            time.sleep(2) ; elapsed += 2
-            if elapsed > param_timeout:
-                module.fail_json(changed=False, msg="Timeout exceeded")
-            instance = ec2.Instance(instance.id)
+        wait_until('stopped', InstanceId=instance.id)
     try:
         response = client.modify_instance_attribute(InstanceId=instance.id, Groups=param_sgs)
     except botocore.exceptions.ClientError as err:
@@ -345,12 +352,7 @@ if param_instance_type is not None and instance.instance_type != param_instance_
             instance.stop()
         except botocore.exceptions.ClientError as err:
             module.fail_json(changed=False, msg=str(err))
-        instance = ec2.Instance(instance.id)
-        while instance.state['Name'] != 'stopped':
-            time.sleep(2) ; elapsed += 2
-            if elapsed > param_timeout:
-                module.fail_json(changed=False, msg="Timeout exceeded")
-            instance = ec2.Instance(instance.id)
+        wait_until('stopped', InstanceId=instance.id)
     try:
         response = client.modify_instance_attribute(InstanceId=instance.id, InstanceType={'Value': param_instance_type})
     except botocore.exceptions.ClientError as err:
@@ -362,9 +364,7 @@ if param_instance_type is not None and instance.instance_type != param_instance_
 Change Tags
 """
 if param_instance_tags is not None:
-    tag_array=[]
-    for key,val in param_instance_tags.iteritems():
-        tag_array.append({'Key': key, 'Value':val})
+    tag_array = [{'Key':key, 'Value':val} for key,val in param_instance_tags.iteritems()]
     try:
         instance.create_tags(Tags=tag_array)
     except botocore.exceptions.ClientError as err:
@@ -397,12 +397,7 @@ if param_state == 'running' and instance.state['Name'] != "running":
     except botocore.exceptions.ClientError as err:
         module.fail_json(changed=False, msg=str(err))
     if param_wait == True:
-        instance = ec2.Instance(instance.id)
-        while instance.state['Name'] != 'running':
-            time.sleep(2) ; elapsed += 2
-            if elapsed > param_timeout:
-                module.fail_json(changed=False, msg="Timeout exceeded")
-            instance = ec2.Instance(instance.id)
+        wait_until('running', InstanceId=instance.id)
 
 """
 Stop the instance if running
@@ -414,11 +409,6 @@ if param_state == 'stopped' and instance.state['Name'] != "stopped":
     except botocore.exceptions.ClientError as err:
         module.fail_json(changed=False, msg=str(err))
     if param_wait == True:
-        instance = ec2.Instance(instance.id)
-        while instance.state['Name'] != 'stopped':
-            time.sleep(2) ; elapsed += 2
-            if elapsed > param_timeout:
-                module.fail_json(changed=False, msg="Timeout exceeded")
-            instance = ec2.Instance(instance.id)
+        wait_until('stopped', InstanceId=instance.id)
 
 module.exit_json(changed=True, instance_ids=[instance.id], instances=[serialize_instances(instance)])
