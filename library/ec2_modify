@@ -48,7 +48,7 @@ Returns:
   - successfully migration ec2.Instance object
 """ 
 def create_instance(**args):
-    global ec2
+    global ec2    
     if ec2 is None:
         raise Exception("Connection to Amazon not opened")
     if 'Arguments' not in args:
@@ -70,13 +70,14 @@ def create_instance(**args):
     image = from_instance.create_image(Name='ansible-image_'+ str(time.time()))
     wait_until('available', ImageId=image.id)
     monitoring = False if from_instance.monitoring['State'] == 'disabled' else True
-    try:
-        response = from_instance.terminate()
-    except botocore.exceptions.ClientError as err:
-        module.fail_json(changed=False, msg=str(err))
-    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
-        module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'terminate' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
-    wait_until('terminated', InstanceId=from_instance_id)
+    if 'private_ip_address' in args['Arguments']:
+        try:
+            response = from_instance.terminate()
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+            module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'terminate' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+        wait_until('terminated', InstanceId=from_instance_id)
     try:
         if 'private_ip_address' in args['Arguments']:
             new_instances = ec2.create_instances(ImageId=image.id, MinCount=1, MaxCount=1,
@@ -96,7 +97,7 @@ def create_instance(**args):
     wait_until('running', InstanceId=to_instance.id)
     try:
         if 'tags' in args['Arguments']:
-            to_instance.create_tags(Tags=args['Arguments']['tags'])
+            if args['Arguments']['tags'] is not None: to_instance.create_tags(Tags=args['Arguments']['tags'])
     except botocore.exceptions.ClientError as err:
         image.deregister()
         to_instance.terminate()
@@ -107,6 +108,14 @@ def create_instance(**args):
         module.fail_json(changed=False, msg=str(err))
     if response['ResponseMetadata']['HTTPStatusCode'] != 200:
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'deregister_images' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+    if 'private_ip_address' not in args['Arguments']:
+        try:
+            response = from_instance.terminate()
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+            module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'terminate' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+        wait_until('terminated', InstanceId=from_instance_id)
     return to_instance        
 
 """
@@ -119,44 +128,33 @@ Returns:
   - ec2.Instance variables dictionary
 """
 def serialize_instances(instance):
-    return_values = { 
-    'private_dns_name': instance.private_dns_name,
-    'public_dns_name': instance.public_dns_name,
-    'public_ip': instance.public_ip_address,
-    'private_ip': instance.private_ip_address,
-    'id': instance.id,
-    'ebs_optimized': instance.ebs_optimized,
-    'state': instance.state['Name'],
-    'state_code': instance.state['Code'],
-    'virtualization_type': instance.virtualization_type,
-    'architecture': instance.architecture,
-    'ramdisk': instance.ramdisk_id,
-    'key_name': instance.key_pair.name,
-    'vpc_subnet_id': instance.subnet.id,
-    'placement': instance.placement['AvailabilityZone'],
-    'launch_time': instance.launch_time.strftime('%Y-%m-%dT%H:%M:%S'),
-    'instance_type': instance.instance_type,
-    'root_device_name': instance.root_device_name,
-    'hypervisor': instance.hypervisor
-     }
-    disks={}
-    for block_device_mapping in instance.block_device_mappings:
-        disk_stat = {
-            'status': block_device_mapping['Ebs']['Status'],
-            'delete_on_termination': block_device_mapping['Ebs']['DeleteOnTermination'],
-            'volume_id': block_device_mapping['Ebs']['VolumeId']
-        }
-        disks[block_device_mapping['DeviceName']] = disk_stat
-    return_values['block_device_mapping'] = disks
-    groups={}
-    for sg in instance.security_groups:
-        groups[sg['GroupName']] = sg['GroupId']
-    return_values['groups'] = groups
-    tags={}
-    for tag in instance.tags:
-        tags[tag['Key']] = tag['Value']
-    return_values['tags'] = tags
-    return return_values
+    return { 
+        'private_dns_name': instance.private_dns_name,
+        'public_dns_name': instance.public_dns_name,
+        'public_ip': instance.public_ip_address,
+        'private_ip': instance.private_ip_address,
+        'id': instance.id,
+        'ebs_optimized': instance.ebs_optimized,
+        'state': instance.state['Name'],
+        'state_code': instance.state['Code'],
+        'virtualization_type': instance.virtualization_type,
+        'architecture': instance.architecture,
+        'ramdisk': instance.ramdisk_id,
+        'key_name': instance.key_pair.name,
+        'vpc_subnet_id': instance.subnet.id,
+        'placement': instance.placement['AvailabilityZone'],
+        'launch_time': instance.launch_time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'instance_type': instance.instance_type,
+        'root_device_name': instance.root_device_name,
+        'hypervisor': instance.hypervisor,
+        'block_device_mapping': [{bdm['DeviceName']: {
+                                    'status':bdm['Ebs']['Status'],
+                                    'delete_on_termination': bdm['Ebs']['DeleteOnTermination'],
+                                    'volume_id': bdm['Ebs']['VolumeId']}
+                                } for bdm in instance.block_device_mappings],
+        'groups': [{sg['GroupName']: sg['GroupId']} for sg in instance.security_groups],
+        'tags': None if instance.tags is None else [{tag['Key']: tag['Value']} for tag in instance.tags]
+    }
 
 """
 Default values
@@ -251,6 +249,10 @@ try:
     instance = ec2.Instance(param_instance_id)
 except botocore.exceptions.ClientError as err:
     module.fail_json(changed=False, msg=str(err))
+try:
+    instance.state['Name']
+except AttributeError:
+    module.fail_json(changed=False, msg="The instance %s does not seem to exist" % instance.id)
 if instance.state['Name'] == 'terminated':
     module.fail_json(changed=False, msg="The instance %s is terminated." % param_instance_id)
 
@@ -262,20 +264,13 @@ NB: The private IP address will not be kept
 """
 if param_subnet_id is not None and param_zone is None and instance.subnet.id != param_subnet_id:
     subnet = ec2.Subnet(param_subnet_id)
-    groups = []
     if param_sgs is not None:
-        for sg in param_sgs:
-            groups.append(sg)
+        groups = param_sgs
     else:
-        for security_group in instance.security_groups:
-            sg = ec2.SecurityGroup(security_group['GroupId'])
-            if subnet.vpc_id == sg.vpc_id:
-                groups.append(sg.id)
-        if len(groups) == 0:
-            for sg in ec2.security_groups.all():
-                if subnet.vpc_id == sg.vpc_id:
-                    groups.append(sg.id)
-                    break
+        groups = [security_group['GroupId'] for security_group in instance.security_groups if subnet.vpc_id == ec2.SecurityGroup(security_group['GroupId']).vpc_id]
+        if not groups:
+            groups = [sg.id for sg in ec2.security_groups.all() if subnet.vpc_id == sg.vpc_id]
+            if groups: groups = [groups[0]]
     instance_args = dict(instance_type=instance.instance_type,
                         availability_zone=subnet.availability_zone,
                         subnet=subnet.id,
@@ -295,29 +290,19 @@ If not, choose one subnet in the new AvailabilityZone.
 NB: The private IP address will not be kept 
 """
 if param_zone is not None and instance.placement['AvailabilityZone'] != param_zone:
-    if param_subnet_id is None:
-        subnet = ec2.Subnet(instance.subnet.id)
-    else:
-        subnet = ec2.Subnet(param_subnet_id)
+    subnet = ec2.Subnet(instance.subnet.id) if param_subnet_id is None else ec2.Subnet(param_subnet_id)
     if subnet.availability_zone != param_zone:
         for subnet in ec2.subnets.all():
             if subnet.availability_zone == param_zone: break
         if subnet.availability_zone != param_zone:
             module.fail_json(changed=False, msg="No subnet detection in AvailabilityZone %s" % param_zone)
-    groups = []
     if param_sgs is not None:
-        for sg in param_sgs:
-            groups.append(sg)
+        groups = param_sgs
     else:
-        for security_group in instance.security_groups:
-            sg = ec2.SecurityGroup(security_group['GroupId'])
-            if subnet.vpc_id == sg.vpc_id:
-                groups.append(sg.id)
-        if len(groups) == 0:
-            for sg in ec2.security_groups.all():
-                if subnet.vpc_id == sg.vpc_id:
-                    groups.append(sg.id)
-                    break
+        groups = [security_group['GroupId'] for security_group in instance.security_groups if subnet.vpc_id == ec2.SecurityGroup(security_group['GroupId']).vpc_id]
+        if not groups:
+            groups = [sg.id for sg in ec2.security_groups.all() if subnet.vpc_id == sg.vpc_id]
+            if groups: groups = [groups[0]]
     instance_args = dict(instance_type=instance.instance_type,
                         availability_zone=param_zone,
                         subnet=subnet.id,
@@ -375,9 +360,7 @@ Change SSH Key Pair
 The private IP address will be kept
 """
 if param_key_pair is not None and (instance.key_pair is None or instance.key_pair.name != param_key_pair):
-    groups = []
-    for sg in instance.security_groups:
-        groups.append(sg['GroupId'])
+    groups = [sg['GroupId'] for sg in instance.security_groups]
     instance_args = dict(instance_type=instance.instance_type,
                         availability_zone=instance.placement['AvailabilityZone'],
                         subnet=instance.subnet.id,
