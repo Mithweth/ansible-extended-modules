@@ -48,7 +48,7 @@ Returns:
   - successfully migration ec2.Instance object
 """ 
 def create_instance(**args):
-    global ec2    
+    global ec2
     if ec2 is None:
         raise Exception("Connection to Amazon not opened")
     if 'Arguments' not in args:
@@ -195,12 +195,13 @@ module = AnsibleModule(argument_spec = dict(
         instance_id = dict(required=True, aliases=['instance']),
         instance_tags = dict(required=False, aliases=['tags'], type='dict'),
         instance_type = dict(required=False, choices=aws_instances),
+        delete_on_termination = dict(required=False, default=False, type='bool'),
         zone = dict(required=False, aliases=['availability_zone', 'placement', 'aws_zone', 'ec2_zone']),
         security_groups = dict(required=False, type='list', aliases=['security_group_id', 'security_group', 'security_group_ids', 'group_id']),
         subnet_id = dict(required=False, aliases=['subnet', 'vpc_subnet_id']),
         state = dict(required=False, default='running', choices=['running', 'stopped']),
         timeout = dict(required=False, default=300, type='int'),
-        wait = dict(required=False, default=False, type='bool'),
+        wait = dict(required=False, default=False, type='bool')
     ))
 
 param_region = module.params.get('region')
@@ -213,6 +214,7 @@ param_zone = module.params.get('zone')
 param_sgs = module.params.get('security_groups')
 param_subnet_id = module.params.get('subnet_id')
 param_instance_tags = module.params.get('instance_tags')
+param_delete_on_term = module.params.get('delete_on_termination')
 param_state = module.params.get('state')
 param_timeout = module.params.get('timeout')
 param_wait = module.params.get('wait')
@@ -346,6 +348,22 @@ if param_instance_type is not None and instance.instance_type != param_instance_
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
 
 """
+Change DeleteOnTermination flag on attached disks
+"""
+if param_delete_on_term is not None:
+    bdm = [{'DeviceName': attach['Device'],
+            'Ebs': {'VolumeId': attach['VolumeId'],
+                    'DeleteOnTermination': param_delete_on_term}
+            } for volume in instance.volumes.all() for attach in volume.attachments if attach['DeleteOnTermination'] != param_delete_on_term]
+    if bdm:
+        try:
+            response = client.modify_instance_attribute(InstanceId=instance.id, BlockDeviceMappings=bdm)
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+            module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+
+"""
 Change Tags
 """
 if param_instance_tags is not None:
@@ -394,4 +412,5 @@ if param_state == 'stopped' and instance.state['Name'] != "stopped":
     if param_wait == True:
         wait_until('stopped', InstanceId=instance.id)
 
+instance = ec2.Instance(instance.id)
 module.exit_json(changed=True, instance_ids=[instance.id], instances=[serialize_instances(instance)])

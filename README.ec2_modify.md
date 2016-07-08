@@ -17,6 +17,7 @@ This module permits those changes without any data losses.
 |----------------|-------------|---------|---------|----------------------|
 | aws_access_key | no          |         |         | <div>AWS access key. If not set then the value of the AWS_ACCESS_KEY_ID, AWS_ACCESS_KEY or EC2_ACCESS_KEY environment variable is used.</div><br/><div style="font-size:small;">aliases: access_key</div> |
 | aws_secret_key | no          |         |         | <div>AWS secret key. If not set then the value of the AWS_SECRET_ACCESS_KEY, AWS_SECRET_KEY, or EC2_SECRET_KEY environment variable is used.</div><br/><div style="font-size:small;">aliases: ec2_secret_key, secret_key</div> |
+| delete_on_termination | no   | no      | <ul><li>yes</li><li>no</li></ul> | set the DeleteOnTerminate flag on all the disks attached to the instance |
 | group_id       | no          |         |         | <div>security group id (or list of ids) to use with the instance</div><br/><div style="font-size:small;">aliases: security_group_id, security_group_ids, security_group, security_groups</div> |
 | instance_id    | yes         |         |         | <div>id of the instance which changes are applied on</div><br/><div style="font-size:small;">aliases: instance</div> |
 | instance_tags  | no          |         |         | <div>a hash/dictionary of tags to add to the instance; '{"key":"value"}' and '{"key":"value","key":"value"}'</div><br/><div style="font-size:small;">aliases: tags</div> |
