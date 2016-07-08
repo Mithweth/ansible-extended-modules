@@ -246,6 +246,7 @@ Set ec2 variables
 session = boto3.session.Session(region_name=param_region, aws_access_key_id=param_access_key, aws_secret_access_key=param_secret_key)
 client = session.client('ec2')
 ec2 = session.resource('ec2')
+changed = False
 
 try:
     instance = ec2.Instance(param_instance_id)
@@ -280,6 +281,7 @@ if param_subnet_id is not None and param_zone is None and instance.subnet.id != 
                         keypair=instance.key_pair.name,
                         security_groups=groups)
     instance = create_instance(Arguments=instance_args, FromInstance=instance)
+    changed = True
 
 """
 Change AvailabilityZone
@@ -312,23 +314,28 @@ if param_zone is not None and instance.placement['AvailabilityZone'] != param_zo
                         keypair=instance.key_pair.name,
                         security_groups=groups)
     instance = create_instance(Arguments=instance_args, FromInstance=instance)
+    changed = True
 
 """
 Change SecurityGroups
 """
 if param_sgs is not None and param_zone is None and param_subnet_id is None:
-    if instance.state['Name'] == 'running':
+    instance_groups = [ sg['GroupId'] for sg in instance.security_groups]
+    instance_groups.sort(); param_sgs.sort()
+    if instance_groups != param_sgs:
+        if instance.state['Name'] == 'running':
+            try:
+                instance.stop()
+            except botocore.exceptions.ClientError as err:
+                module.fail_json(changed=False, msg=str(err))
+            wait_until('stopped', InstanceId=instance.id)
         try:
-            instance.stop()
+            response = client.modify_instance_attribute(InstanceId=instance.id, Groups=param_sgs)
         except botocore.exceptions.ClientError as err:
             module.fail_json(changed=False, msg=str(err))
-        wait_until('stopped', InstanceId=instance.id)
-    try:
-        response = client.modify_instance_attribute(InstanceId=instance.id, Groups=param_sgs)
-    except botocore.exceptions.ClientError as err:
-        module.fail_json(changed=False, msg=str(err))
-    if response['ResponseMetadata']['HTTPStatusCode'] != 200:
-        module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+        if response['ResponseMetadata']['HTTPStatusCode'] != 200:
+            module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+        changed = True
 
 """
 Change InstanceType
@@ -346,15 +353,16 @@ if param_instance_type is not None and instance.instance_type != param_instance_
         module.fail_json(changed=False, msg=str(err))
     if response['ResponseMetadata']['HTTPStatusCode'] != 200:
         module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+    changed = True
 
 """
 Change DeleteOnTermination flag on attached disks
 """
 if param_delete_on_term is not None:
-    bdm = [{'DeviceName': attach['Device'],
-            'Ebs': {'VolumeId': attach['VolumeId'],
-                    'DeleteOnTermination': param_delete_on_term}
-            } for volume in instance.volumes.all() for attach in volume.attachments if attach['DeleteOnTermination'] != param_delete_on_term]
+    bdm = [{'DeviceName': attach['DeviceName'],
+            'Ebs': {'VolumeId': attach['Ebs']['VolumeId'],
+            'DeleteOnTermination': param_delete_on_term}} for attach in instance.block_device_mappings
+                if attach['Ebs']['Status'] == 'attached' and attach['Ebs']['DeleteOnTermination'] != param_delete_on_term]
     if bdm:
         try:
             response = client.modify_instance_attribute(InstanceId=instance.id, BlockDeviceMappings=bdm)
@@ -362,16 +370,21 @@ if param_delete_on_term is not None:
             module.fail_json(changed=False, msg=str(err))
         if response['ResponseMetadata']['HTTPStatusCode'] != 200:
             module.fail_json(changed=False, msg="The HTTPStatusCode of the command 'modify_instance_attribute' is %d " % response['ResponseMetadata']['HTTPStatusCode'])
+        changed = True
 
 """
 Change Tags
 """
 if param_instance_tags is not None:
     tag_array = [{'Key':key, 'Value':val} for key,val in param_instance_tags.iteritems()]
-    try:
-        instance.create_tags(Tags=tag_array)
-    except botocore.exceptions.ClientError as err:
-        module.fail_json(changed=False, msg=str(err))
+    instance_tags = instance.tags
+    tag_array.sort(); instance_tags.sort()
+    if tag_array != instance_tags:
+        try:
+            instance.create_tags(Tags=tag_array)
+        except botocore.exceptions.ClientError as err:
+            module.fail_json(changed=False, msg=str(err))
+        changed = True
 
 """
 Change SSH Key Pair
@@ -387,6 +400,7 @@ if param_key_pair is not None and (instance.key_pair is None or instance.key_pai
                         keypair=param_key_pair,
                         security_groups=groups)
     instance = create_instance(Arguments=instance_args, FromInstance=instance)
+    changed = True
 
 """
 Start the instance if stopped
@@ -413,4 +427,4 @@ if param_state == 'stopped' and instance.state['Name'] != "stopped":
         wait_until('stopped', InstanceId=instance.id)
 
 instance = ec2.Instance(instance.id)
-module.exit_json(changed=True, instance_ids=[instance.id], instances=[serialize_instances(instance)])
+module.exit_json(changed=changed, instance_ids=[instance.id], instances=[serialize_instances(instance)])
