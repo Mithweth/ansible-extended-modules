@@ -201,8 +201,8 @@ module = AnsibleModule(argument_spec = dict(
         subnet_id = dict(required=False, aliases=['subnet', 'vpc_subnet_id']),
         state = dict(required=False, default='running', choices=['running', 'stopped']),
         timeout = dict(required=False, default=300, type='int'),
-        wait = dict(required=False, default=False, type='bool')
-    ))
+        wait = dict(required=False, default=False, type='bool')),
+        supports_check_mode=False)
 
 param_region = module.params.get('region')
 param_access_key = module.params.get('access_key')
