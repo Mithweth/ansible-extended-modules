@@ -128,6 +128,7 @@ Returns:
   - ec2.Instance variables dictionary
 """
 def serialize_instances(instance):
+    keypair = instance.key_pair.name if instance.key_pair is not None else None
     return { 
         'private_dns_name': instance.private_dns_name,
         'public_dns_name': instance.public_dns_name,
@@ -140,7 +141,7 @@ def serialize_instances(instance):
         'virtualization_type': instance.virtualization_type,
         'architecture': instance.architecture,
         'ramdisk': instance.ramdisk_id,
-        'key_name': instance.key_pair.name,
+        'key_name': keypair,
         'vpc_subnet_id': instance.subnet.id,
         'placement': instance.placement['AvailabilityZone'],
         'launch_time': instance.launch_time.strftime('%Y-%m-%dT%H:%M:%S'),
