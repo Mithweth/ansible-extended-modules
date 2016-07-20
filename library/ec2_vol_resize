@@ -2,8 +2,14 @@
 
 import os, sys, json, time
 from ansible.module_utils.basic import AnsibleModule
-import boto3
-import botocore
+
+HAS_BOTO = False
+try:
+    import boto3
+    import botocore
+    HAS_BOTO = True
+except ImportError:
+    pass
 
 aws_regions=[
         'us-east-1',
@@ -27,6 +33,9 @@ module = AnsibleModule(argument_spec = dict(
         device = dict(required=False, aliases=['device_name']),
         timeout = dict(required=False, default=300, type='int'),
     ))
+
+if not HAS_BOTO:
+    module.fail_json(msg='python-boto3 module required')
 
 param_region = module.params.get('region')
 param_size = module.params.get('size')

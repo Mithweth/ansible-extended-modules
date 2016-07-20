@@ -2,8 +2,14 @@
 
 import os, sys, json, time
 from ansible.module_utils.basic import AnsibleModule
-import boto3
-import botocore
+
+HAS_BOTO = False
+try:
+    import boto3
+    import botocore
+    HAS_BOTO = True
+except ImportError:
+    pass
 
 """
 Timer with timeout
@@ -204,6 +210,9 @@ module = AnsibleModule(argument_spec = dict(
         timeout = dict(required=False, default=300, type='int'),
         wait = dict(required=False, default=False, type='bool')),
         supports_check_mode=False)
+
+if not HAS_BOTO:
+    module.fail_json(msg='python-boto3 module required')
 
 param_region = module.params.get('region')
 param_access_key = module.params.get('access_key')
