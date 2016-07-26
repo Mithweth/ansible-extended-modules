@@ -1,0 +1,295 @@
+#!/usr/bin/python
+
+from time import sleep
+from ansible.module_utils.basic import AnsibleModule
+
+HAS_PYPARTED = False
+try:
+    import parted
+    import _ped
+    HAS_PYPARTED = True
+except ImportError:
+    pass
+
+def partition_facts(partition):
+    global availableFlags
+    global availableTypes
+    partition_facts = {
+        'number': partition.number,
+        'active': partition.active,
+        'name': partition.path,
+        'geometry': { 'start': partition.geometry.start, 'end': partition.geometry.end},
+        'flags': [],
+        'filesystem': partition.fileSystem.type if partition.fileSystem else None,
+        'type': availableTypes[partition.type] if partition.type in availableTypes else "unknown"
+    }
+    for flag, value in availableFlags.iteritems():
+        if partition.getFlag(flag): partition_facts['flags'].append(value)
+    return partition_facts
+
+def disk_facts(disk):
+    global availableFlags
+    device = disk.device
+    cylinders, heads, sectors = device.hardwareGeometry
+    device_info = {
+        'geometry': {   'cylinders': cylinders,
+                        'heads': heads,
+                        'sectors': sectors,},
+        'name': device.path,
+        'model': device.model,
+        'size': device.length,
+        'sectorSize': device.sectorSize
+    }
+    device_info['partition_table'] = disk.type
+    device_info['partitions'] = []
+    device_info['flags'] = []
+    for flag, value in availableFlags.iteritems():
+        if disk.getFlag(flag): device_info['flags'].append(value)
+    for partition in disk.partitions:
+        device_info['partitions'].append(partition_facts(partition))
+    return device_info
+
+def create_partition(start_pos, end_pos, disk, param_type):
+    device=disk.device
+    try:
+        geometry = parted.Geometry(start=start_pos, end=end_pos, device=device)
+    except _ped.DiskException as err:
+        module.fail_json(changed=False, msg=str(err))
+    if param_type == 'logical':
+        partition_type = parted.PARTITION_LOGICAL
+    elif param_type == 'extended':
+        partition_type = parted.PARTITION_EXTENDED
+    else:
+        partition_type = parted.PARTITION_NORMAL
+    try:
+        new_partition = parted.Partition(disk=disk,type=partition_type,geometry=geometry)
+    except _ped.DiskException as err:
+        module.fail_json(changed=False, msg=str(err))      
+    return new_partition
+
+def get_range(start, end, part_type, disk):
+    device = disk.device
+    ret_start = start
+    ret_end = end
+    if not start:
+        if part_type == 'logical':
+            if disk.getExtendedPartition():
+                ret_start = disk.getExtendedPartition().geometry.start + 4 * device.sectorSize
+                for partition in disk.partitions:
+                    if partition.type == parted.PARTITION_LOGICAL:
+                        if end == partition.geometry.end:
+                            ret_start = partition.geometry.start
+                            break
+                        if ret_start >= partition.geometry.start and ret_start <= partition.geometry.end:
+                            ret_start = partition.geometry.end + 4 * device.sectorSize
+        else:
+            ret_start = 4 * device.sectorSize
+            for partition in disk.partitions:
+                if partition.type == parted.PARTITION_EXTENDED or partition.type == parted.PARTITION_NORMAL:
+                    if end == partition.geometry.end:
+                        ret_start = partition.geometry.start
+                        break
+                    if ret_start >= partition.geometry.start and ret_start <= partition.geometry.end:
+                        ret_start = partition.geometry.end + 1
+    if not end:
+        if part_type == 'logical':
+            ret_end = device.length - 1
+            if disk.getExtendedPartition():
+                ret_end = disk.getExtendedPartition().geometry.end
+                for partition in disk.partitions:
+                    if partition.type == parted.PARTITION_LOGICAL:
+                        if start == partition.geometry.start:
+                            ret_end = partition.geometry.end
+                            break
+                        if ret_start < partition.geometry.start:
+                            ret_end = partition.geometry.start - 1
+                            break
+                if ret_start > ret_end:
+                    for partition in disk.partitions:
+                        if partition.type == parted.PARTITION_LOGICAL:
+                            return (partition.geometry.start, partition.geometry.end)
+                            break
+        else:
+            ret_end = device.length - 1
+            for partition in disk.partitions:
+                if partition.type == parted.PARTITION_EXTENDED or partition.type == parted.PARTITION_NORMAL:
+                    if start == partition.geometry.start:
+                        ret_end = partition.geometry.end
+                        break
+                    if ret_start < partition.geometry.start:
+                        ret_end = partition.geometry.start - 1
+                        break
+            if ret_start > ret_end:
+                for partition in disk.partitions:
+                    if partition.type == parted.PARTITION_EXTENDED or partition.type == parted.PARTITION_NORMAL:
+                        return (partition.geometry.start, partition.geometry.end)
+    return (ret_start, ret_end)
+
+def main():
+    global availableFlags
+    global availableTypes
+    module = AnsibleModule(argument_spec = dict(
+            disk = dict(required=True, aliases=['device']),
+            end = dict(required=False, type='int'),
+            flags = dict(required=False, type='list', aliases=['flag'], choices=availableFlags.values()),
+            force = dict(required=False, default=False, type='bool'),
+            name = dict(required=False, aliases=['path']),
+            start = dict(required=False, type='int'),
+            state = dict(required=False, default='present', choices=['absent', 'present', 'reconfigure']),
+            table = dict(required=False, default='msdos', choices=['gpt', 'msdos']),
+            type = dict(required=False, default='primary', choices=availableTypes.values())
+        ),
+        supports_check_mode=True
+    )
+
+    if not HAS_PYPARTED:
+        module.fail_json(msg='pyparted module required')
+
+    param_disk = module.params.get('disk')
+    param_start = module.params.get('start')
+    param_force = module.params.get('force')
+    param_end = module.params.get('end')
+    param_flags = module.params.get('flags')
+    param_name = module.params.get('name')
+    param_state = module.params.get('state')
+    param_table = module.params.get('table')
+    param_type = module.params.get('type')
+    changed = False
+
+    ## TODO:
+    ## 'force' flag: 
+    ##     - delete extended partition even if there are logical partition (table:msdos)
+    ##     - create logical partition even if there are no extended partition (table:msdos)
+    ## 'state' is 'reconfigure' to change table and flags
+    ## Docs !
+
+    if param_state == 'absent':
+        if not param_name and (not param_start or not param_end):
+            module.fail_json(changed=False, msg="Either 'name' or 'start' and 'end' are required when 'state' is absent")
+
+    try:
+        device = parted.getDevice(param_disk)
+    except _ped.IOException as err:
+        module.fail_json(changed=False, msg=str(err))
+
+    if device.busy:
+        module.fail_json(changed=False, msg="%d: target is busy" % device.path)
+
+    try:
+        disk = parted.newDisk(device)
+    except _ped.DiskException:
+        disk = parted.freshDisk(device, param_table)
+
+    if param_state == 'reconfigure':
+        if disk.type != param_table:
+            disk = parted.freshDisk(device, param_table)        
+
+    if param_state == 'present':
+        start_pos, end_pos = get_range(param_start, param_end, param_type, disk)
+
+        # Test if partition exists and if geometry is available
+        for partition in disk.partitions:
+            if param_name is not None and partition.path == param_name:
+                module.exit_json(changed=False,partition=partition_facts(partition))
+            elif partition.geometry.start == start_pos and \
+                partition.geometry.end == end_pos and \
+                availableTypes[partition.type] == param_type:
+                module.exit_json(changed=False,partition=partition_facts(partition))
+
+            if param_type != 'logical' and partition.type != parted.PARTITION_EXTENDED:
+                if start_pos >= partition.geometry.start and start_pos <= partition.geometry.end:
+                    module.fail_json(changed=False,msg="Partition %s exists at start position %d" % (partition.path, start_pos))
+                if end_pos >= partition.geometry.start and end_pos <= partition.geometry.end:
+                    module.fail_json(changed=False,msg="Partition %s exists at end position %d" % (partition.path, end_pos))
+            if param_type == 'logical' and partition.type == parted.PARTITION_EXTENDED:
+                if start_pos < partition.geometry.start or start_pos > partition.geometry.end:
+                    module.fail_json(changed=False,msg="Logical partitions starts at %d while the extended partition is located %d-%d" % (start_pos, partition.geometry.start, partition.geometry.end))
+                if end_pos < partition.geometry.start or end_pos > partition.geometry.end:
+                    module.fail_json(changed=False,msg="Logical partitions ends at %d while the extended partition is located at %d-%d" % (end_pos, partition.geometry.start, partition.geometry.end))
+
+        # Partition does not exist
+        if param_table == 'msdos':
+            pri_part_nb, ext_part_nb, log_part_nb = \
+            (len([partition for partition in disk.partitions if partition.type == parted.PARTITION_NORMAL]),
+                len([partition for partition in disk.partitions if partition.type == parted.PARTITION_EXTENDED]),
+                len([partition for partition in disk.partitions if partition.type == parted.PARTITION_LOGICAL]))
+            if param_type == 'logical' and ext_part_nb == 0 and not module.check_mode:
+                module.fail_json(changed=False, msg="Cannot create logical partition without extended partition")
+            if param_type == 'primary' and pri_part_nb == disk.maxPrimaryPartitionCount and not module.check_mode:
+                module.fail_json(changed=False, msg="Cannot create more than %d primary partitions" % disk.maxPrimaryPartitionCount)
+            if param_type == 'primary' and pri_part_nb == disk.maxPrimaryPartitionCount - 1 and ext_part_nb == 1 and not module.check_mode:
+                module.fail_json(changed=False, msg="Cannot create more than %d primary partitions and one extended partition" % (disk.maxPrimaryPartitionCount - 1))
+            if param_type == 'extended' and ext_part_nb == 1 and not module.check_mode:
+                module.fail_json(changed=False, msg="Cannot create more than one extended partitions")
+        if param_table == 'gpt' and param_type != 'primary':
+            module.fail_json(changed=False, msg="Only primary partitions are allowed on GPT disks")
+        
+        if start_pos >= end_pos:
+            module.fail_json(changed=False, msg="Partition starts at position %d and ends at position %d" % (start_pos, end_pos))
+
+        new_partition = create_partition(start_pos, end_pos, disk, param_type)
+        if param_flags:
+            partition_flags = [key for flag in param_flags for key,val in availableFlags.iteritems() if val == flag]
+            for partition_flag in partition_flags:
+                new_partition.setFlag(partition_flag)
+        try:
+            disk.addPartition(new_partition,parted.Constraint(device=device))
+        except _ped.DiskException as err:
+            module.fail_json(changed=False, msg=str(err))
+        if param_name is not None and new_partition.path != param_name:
+            module.fail_json(changed=False, msg="the next partition will be %s and not %s, as wished !" % (new_partition.path, param_name))
+        if not module.check_mode:
+            try:
+                changed = disk.commit()
+                sleep(2)
+            except _ped.DiskException as err:
+                 module.fail_json(changed=False, msg=str(err)) 
+        module.exit_json(changed=changed,partition=partition_facts(new_partition))
+
+    elif param_state == 'absent':
+        # Test if partition exists or geometry not available
+        start_pos, end_pos, del_partition = (param_start, param_end, None)
+        for partition in disk.partitions:
+            if (param_name is not None and partition.path == param_name) or \
+               (partition.geometry.start == start_pos and \
+                partition.geometry.end == end_pos and \
+                availableTypes[partition.type] == param_type):
+                del_partition = partition
+                break
+        # TODO: Erase extended partition
+        if del_partition:
+            try:
+                disk.deletePartition(del_partition)
+            except _ped.PartitionException as err:
+                module.fail_json(changed=False, msg=str(err)) 
+            if not module.check_mode:
+                try:
+                    changed = disk.commit()
+                    sleep(2)
+                except _ped.DiskException as err:
+                     module.fail_json(changed=False, msg=str(err)) 
+        module.exit_json(changed=changed,device=disk_facts(disk))
+
+availableTypes = {
+            parted.PARTITION_NORMAL:    "primary",
+            parted.PARTITION_LOGICAL:   "logical",
+            parted.PARTITION_EXTENDED:  "extended",
+            parted.PARTITION_FREESPACE: "free-space",
+            parted.PARTITION_METADATA:  "metadata"
+        }
+
+availableFlags = {}
+__flag = _ped.partition_flag_next(0)
+availableFlags[__flag] = _ped.partition_flag_get_name(__flag)
+__readFlags = True
+
+while __readFlags:
+    __flag = _ped.partition_flag_next(__flag)
+    if not __flag:
+        __readFlags = False
+    else:
+        availableFlags[__flag] = _ped.partition_flag_get_name(__flag)
+
+if __name__ == '__main__':
+    main()
+
