@@ -1,0 +1,165 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+
+import time
+from ansible.module_utils.basic import AnsibleModule, bytes_to_human
+from ansible.module_utils.vmware import connect_to_api, find_vm_by_id, vmware_argument_spec
+
+HAS_PYVMOMI = False
+try:
+    from pyVmomi import vim
+    HAS_PYVMOMI = True
+except ImportError:
+    pass
+
+def search_vm(conn, vm_name, index=None):
+    if index is None:
+        index = conn.searchIndex.FindByInventoryPath('/')
+    if isinstance(index, vim.Folder):
+        for child in index.childEntity:
+            vm = search_vm(conn, vm_name, child)
+            if vm is not None:
+                return vm
+    if isinstance(index, vim.Datacenter):
+        return search_vm(conn, vm_name, index.vmFolder)
+    if isinstance(index, vim.VirtualMachine):
+        if index.name == vm_name:
+            return index
+        else:
+            return None
+
+def get_facts(device):
+    return {
+        "scsi_number": list(str(device.key))[2:] if device.key else None,
+        "label": device.deviceInfo.label,
+        "datastore": device.backing.datastore.name,
+        "thin_provisioning": device.backing.thinProvisioned,
+        "uuid": device.backing.uuid,
+        "file_name": device.backing.fileName,
+        "size": bytes_to_human(device.capacityInBytes)
+    }
+
+def get_unit_number(vm):
+    unit_number = 0
+    for dev in vm.config.hardware.device:
+        if hasattr(dev.backing, 'fileName'):
+            unit_number = int(dev.unitNumber) + 1
+            # unit_number 7 reserved for scsi controller
+            if unit_number == 7:
+                unit_number += 1
+            if unit_number >= 16:
+                raise ValueError("Too many disks")
+    return unit_number
+
+def execute_task(task):
+    while task.info.state not in [vim.TaskInfo.State.error,
+                                  vim.TaskInfo.State.success]:
+        time.sleep(1)
+    if task.info.state == vim.TaskInfo.State.error:
+        module.fail_json(msg='Cannot complete action. Results: %s' % task.info.error)
+    return True
+
+def main():
+    argument_spec = vmware_argument_spec()
+    argument_spec.update(
+        dict(
+            name=dict(required=True, type='str', aliases=['guest']),
+            size=dict(type='int'),
+            state=dict(default='present', choices=['present', 'absent', 'list']),
+            uuid=dict()
+        )
+    )
+    module = AnsibleModule(
+        argument_spec=argument_spec,
+        supports_check_mode=True,
+        required_if=[
+            ['state', 'absent', ['uuid']],
+            ['state', 'present', ['size']]
+        ]
+    )
+
+    if not HAS_PYVMOMI:
+        module.fail_json(msg='pyvmomi module required')
+
+    conn = connect_to_api(module)
+
+    vm = search_vm(conn, module.params['name'])
+
+    if vm is None:
+        module.fail_json(msg='Guest %(name)s not found' % module.params)
+
+    disks = [d for d in vm.config.hardware.device
+             if isinstance(d, vim.vm.device.VirtualDisk)]
+
+    if module.params['state'] == 'present':
+        try:
+            index = get_unit_number(vm)
+        except Exception as e:
+            module.fail_json(msg=str(e))
+        if module.params.get('uuid'):
+            for disk in disks:
+                if disk.backing.uuid == module.params.get('uuid'):
+                    break
+            else:
+                module.fail_json(msg='No disk with UUID %(uuid)s found' % module.params)
+            diskspec = vim.vm.device.VirtualDeviceSpec()
+            diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.edit
+            diskspec.device = disk
+            if module.params['size'] * 1024 * 1024 < diskspec.device.capacityInKB:
+                module.fail_json(msg="Reducing disk size is not allowed.")
+        else:
+            scsi_ctl = None
+            for device in vm.config.hardware.device:
+                if isinstance(device, vim.vm.device.VirtualLsiLogicController) or \
+                        isinstance(device, vim.vm.device.ParaVirtualSCSIController) or \
+                        isinstance(device, vim.vm.device.VirtualBusLogicController) or \
+                        isinstance(device, vim.vm.device.VirtualLsiLogicSASController):
+                    scsi_ctl = vim.vm.device.VirtualDeviceSpec()
+                    scsi_ctl.device = device
+            if scsi_ctl is None:
+                module.fail_json(msg='No SCSI Controller found on %(name)s' % module.params)
+
+            diskspec = vim.vm.device.VirtualDeviceSpec()
+            diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.add
+            diskspec.fileOperation = vim.vm.device.VirtualDeviceSpec.FileOperation.create
+            diskspec.device = vim.vm.device.VirtualDisk()
+            diskspec.device.backing = vim.vm.device.VirtualDisk.FlatVer2BackingInfo()
+            diskspec.device.backing.diskMode = 'persistent'
+            diskspec.device.backing.thinProvisioned = True
+            diskspec.device.controllerKey = scsi_ctl.device.key
+            diskspec.device.unitNumber = index
+        
+        diskspec.device.capacityInKB = module.params['size'] * 1024 * 1024
+        configspec = vim.vm.ConfigSpec()
+        configspec.deviceChange.append(diskspec)
+        task = vm.ReconfigVM_Task(spec=configspec)
+        execute_task(task)
+        module.exit_json(changed=True)
+
+    if module.params['state'] == 'absent':
+        for disk in disks:
+            if disk.backing.uuid == module.params.get('uuid'):
+                break
+        else:
+            module.fail_json(msg="Disk with UUID %(uuid)s not found" % module.params)
+
+        diskspec = vim.vm.device.VirtualDeviceSpec()
+        diskspec.operation = vim.vm.device.VirtualDeviceSpec.Operation.remove
+        diskspec.fileOperation = vim.vm.device.VirtualDeviceSpec.FileOperation.destroy
+        diskspec.device = disk
+        configspec = vim.vm.ConfigSpec()
+        configspec.deviceChange.append(diskspec)
+        task = vm.ReconfigVM_Task(spec=configspec)
+        execute_task(task)
+        module.exit_json(changed=True)
+
+    if module.params['state'] == 'list':
+        facts = []
+        for d in disks:
+            if module.params.get('uuid') is None or d.backing.uuid == module.params.get('uuid'):
+                facts.append(get_facts(d))
+        module.exit_json(changed=False, volumes=facts)
+
+if __name__ == '__main__':
+    main()
