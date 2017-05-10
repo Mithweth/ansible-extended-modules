@@ -66,9 +66,10 @@ This module permits those changes without any data losses.
       with_items: modified.instances
 ```
 
-## Return values
+## Notes
 
-| name      | description    | returned | type | sample             |
-|-----------|----------------|----------|------|--------------------|
-| volumes   | metadata about VM guest disks | state=list | dict | None |
-
+* If parameters are not set within the module, the following environment variables can be used in decreasing order of precedence : `AWS_ACCESS_KEY_ID` or `AWS_ACCESS_KEY` or `EC2_ACCESS_KEY`, `AWS_SECRET_ACCESS_KEY` or `AWS_SECRET_KEY` or `EC2_SECRET_KEY`, `AWS_SECURITY_TOKEN` or `EC2_SECURITY_TOKEN`, `AWS_REGION` or `EC2_REGION`
+* Changes on parameters `vpc_subnet_id`, `key_name` and/or `zone` will return a copy of the instance whose id will be different.
+* Changes on parameters `vpc_subnet_id` or `zone` will change the private IP of the instance.
+* If you use the `zone` parameter without specifing a new subnet id, the subnet will also change to a subnet in the new zone.
+* If you use the `vpc_subnet_id` parameter without specifing a new security group id, the security group will also change to one in the new subnet.
