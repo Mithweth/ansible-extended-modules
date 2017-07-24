@@ -1,0 +1,115 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+
+import uuid
+import socket
+from ansible.module_utils.basic import AnsibleModule
+import ansible.module_utils.vmware as vmware
+
+HAS_PYVMOMI = False
+try:
+    from pyVmomi import vim
+    HAS_PYVMOMI = True
+except ImportError:
+    pass
+
+def main():
+    argument_spec = vmware.vmware_argument_spec()
+    argument_spec.update(
+        dict(
+            name=dict(required=True, type='str', aliases=['guest']),
+            attributes=dict(type='dict'),
+            state=dict(default='present', choices=['present', 'absent', 'list', 'flush'])
+        )
+    )
+    module = AnsibleModule(
+        argument_spec=argument_spec,
+        supports_check_mode=True,
+        required_if=[
+            ['state', 'absent', ['attributes']],
+            ['state', 'present', ['attributes']]
+        ]
+    )
+
+    # If present, check all the given attributes are the same, or update the differents
+    # If absent, delete all the attributes whose keys are given
+
+    if not HAS_PYVMOMI:
+        module.fail_json(msg='pyvmomi module required')
+    
+    try:
+        content = vmware.connect_to_api(module)
+    except socket.error as e:
+        module.fail_json(msg=e.strerror)
+
+    host = vmware.find_vm_by_name(content, module.params['name'])
+    results = dict(changed=False)
+
+    if host is None:
+        module.fail_json(msg="Guest %s not found" % module.params['name'])
+
+    if module.params['state'] == 'present':
+        for attr_name, attr_val in module.params['attributes'].iteritems():
+            cf_key = None
+            for field in content.customFieldsManager.field:
+                if field.name == attr_name:
+                    cf_key = field.key
+                    break
+            else:
+                fd = content.customFieldsManager.AddFieldDefinition(name=attr_name, moType=vim.VirtualMachine)
+                cf_key = fd.key
+            for host_field in host.customValue:
+                if cf_key == host_field.key:
+                    if host_field.value != attr_val:
+                        content.customFieldsManager.SetField(entity=host, key=cf_key, value=attr_val)
+                        if 'changes' not in results:
+                            results['changes'] = {}
+                        results['changes'][attr_name] = attr_val
+                        results['changed'] = True
+                    break
+            else:
+                content.customFieldsManager.SetField(entity=host, key=cf_key, value=attr_val)
+                if 'changes' not in results:
+                    results['changes'] = {}
+                results['changes'][attr_name] = attr_val
+                results['changed'] = True
+
+    if module.params['state'] == 'absent':
+        for attr_name in module.params['attributes']:
+            cf_key = None
+            for field in content.customFieldsManager.field:
+                if field.name == attr_name:
+                    for host_field in host.customValue:
+                        if field.key == host_field.key:
+                            if host_field.value != "":
+                                content.customFieldsManager.SetField(entity=host, key=field.key, value="")
+                                if 'changes' not in results:
+                                    results['changes'] = []
+                                results['changes'].append(attr_name)
+                                results['changed'] = True
+                            break
+
+    if module.params['state'] == 'list':
+        results['attributes'] = {}
+        for host_field in host.customValue:
+            if host_field.value != "":
+                for cfield in content.customFieldsManager.field:
+                    if cfield.key == host_field.key:
+                        results['attributes'][cfield.name] = host_field.value
+                        break
+
+    if module.params['state'] == 'flush':
+        for host_field in host.customValue:
+            for field in content.customFieldsManager.field:
+                if field.key == host_field.key:
+                    if 'changes' not in results:
+                        results['changes'] = []
+                    results['changes'].append(field.name)
+            content.customFieldsManager.RemoveFieldDefinition(key=host_field.key)
+            results['changed'] = True
+
+    module.exit_json(**results)
+
+if __name__ == '__main__':
+    main()
