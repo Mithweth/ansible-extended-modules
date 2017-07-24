@@ -1,0 +1,208 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+
+import uuid
+import socket
+from ansible.module_utils.basic import AnsibleModule
+import ansible.module_utils.vmware as vmware
+
+HAS_PYVMOMI = False
+try:
+    from pyVmomi import vim
+    HAS_PYVMOMI = True
+except ImportError:
+    pass
+
+def get_cluster_by_vm(content, vm_name):
+    vm = vmware.find_vm_by_name(content, vm_name)
+    for cluster in vmware.get_all_objs(content,
+                                       [vim.ClusterComputeResource]).keys():
+        for hs in cluster.host:
+            if vm.runtime.host == hs:
+                    return cluster
+    return None
+
+class VMWareRule(object):
+    def __init__(self, name, cluster=None, content=None):
+        self.name = name
+        self.cluster = cluster
+        if content is not None and cluster is None:
+            for cluster in vmware.get_all_objs(content,
+                                       [vim.ClusterComputeResource]).keys():
+                if self.cluster: break
+                for rule in cluster.configuration.rule:
+                    if rule.name == self.name:
+                        self.cluster = cluster
+                        break
+
+    def create(self, vms, affinity=True):
+        if affinity:
+            rule = vim.cluster.AffinityRuleSpec(
+                vm=vms,
+                enabled=True,
+                mandatory=True,
+                name=self.name)
+        else:
+            rule = vim.cluster.AntiAffinityRuleSpec(
+                vm=vms,
+                enabled=True,
+                mandatory=True,
+                name=self.name)
+        ruleSpec = vim.cluster.RuleSpec(info=rule, operation='add')
+        configSpec = vim.cluster.ConfigSpecEx(rulesSpec=[ruleSpec])
+        task = self.cluster.ReconfigureEx(configSpec, modify=True)
+        vmware.wait_for_task(task)
+        if self.exists():
+            return True
+        return False
+
+    def delete(self):
+        rule = self.exists()
+        if rule is False:
+            return True
+        rule_spec = vim.cluster.RuleSpec(removeKey=rule.key, operation='remove')
+        configSpec = vim.cluster.ConfigSpecEx(rulesSpec=[rule_spec])
+        task = self.cluster.ReconfigureEx(configSpec, modify=True)
+        vmware.wait_for_task(task)
+        if not self.exists():
+            return True
+        return False
+
+    def exists(self):
+        for rule in self.cluster.configuration.rule:
+            if rule.name == self.name:
+                return rule
+        return False
+
+    def show(self):
+        rule = self.exists()
+        if rule is False:
+            raise ValueError("Rule %s not found" % self.name)
+        return {
+            "keeptogether": isinstance(rule, vim.cluster.AffinityRuleSpec),
+            "vms": [vm.name for vm in rule.vm] if hasattr(rule, 'vm') else None,
+            "name": rule.name,
+            "mandatory": rule.mandatory,
+            "enabled": rule.enabled,
+            "cluster": self.cluster.name
+        }
+
+def main():
+    argument_spec = vmware.vmware_argument_spec()
+    argument_spec.update(
+        dict(
+            hosts=dict(type='list'),
+            keeptogether=dict(type='bool'),
+            state=dict(default='present', choices=['present', 'absent', 'list']),
+            name=dict(type='str', aliases=['affinity_name', 'group_name'])
+        )
+    )
+    module = AnsibleModule(
+        argument_spec=argument_spec,
+        supports_check_mode=True,
+        required_if=[
+            ['state', 'absent', ['name']],
+            ['state', 'present', ['hosts', 'keeptogether']]
+        ]
+    )
+
+    if not HAS_PYVMOMI:
+        module.fail_json(msg='pyvmomi module required')
+    
+    try:
+        content = vmware.connect_to_api(module)
+    except socket.error as e:
+        module.fail_json(msg=e.strerror, **module.params)
+
+    if module.params['state'] == 'present':
+        module.params['hosts'] = list(set(module.params['hosts']))
+        cluster = None
+        hosts = []
+        if len(module.params['hosts']) == 1:
+            module.fail_json(msg="At least 2 machines are needed", **module.params)
+        for host_name in module.params['hosts']:
+            host = vmware.find_vm_by_name(content, host_name)
+            if host is None:
+                module.fail_json(msg="%s not found" % host_name, **module.params)
+            host_cluster = get_cluster_by_vm(content, host_name)
+            if host_cluster is None:
+                module.fail_json(msg="cluster not found for %s" % host_name, **module.params)
+            if cluster is None:
+                cluster = host_cluster
+            elif host_cluster != cluster:
+                module.fail_json(msg="Hosts are different clusters: " + 
+                                 "Cluster is %s but %s is on %s" % (
+                                     cluster.name, host_name, host_cluster.name),
+                                 **module.params)
+            hosts.append(host)
+        default_name = "Affinity" if module.params['keeptogether'] else "AntiAffinity"
+        name = (module.params['name']
+                if module.params['name']
+                else "%s-%s" % (default_name, uuid.uuid1()))
+        rule = VMWareRule(name, cluster)
+        rule_details = rule.exists()
+        if rule_details is False:
+            try:
+                res = rule.create(hosts, module.params['keeptogether'])
+            except vmware.TaskError as e:
+                module.fail_json(msg=e.message, cluster=cluster.name, **module.params)
+            if res is False:
+                module.fail_json(msg="Error while creation", cluster=cluster.name, **module.params)
+            module.exit_json(changed=True, rule=rule.show())
+        recreates = False
+        if module.params['keeptogether'] != isinstance(rule_details, vim.cluster.AffinityRuleSpec):
+            recreates = True
+        else:
+            for vm in hosts:
+                if vm not in rule_details.vm:
+                    recreates = True
+                    break
+            if not recreates:
+                for vm in rule_details.vm:
+                    if vm not in hosts:
+                        recreates = True
+                        break
+        if recreates:
+            try:
+                res = rule.delete()
+            except vim.fault.NoPermission:
+                module.fail_json(msg="permission denied", cluster=cluster.name, **module.params)
+            except vmware.TaskError as e:
+                module.fail_json(msg=e.message, **module.params)
+            if res is False:
+                module.fail_json(msg="Error while deletion", cluster=cluster.name, **module.params)
+            try:
+                res = rule.create(hosts, module.params['keeptogether'])
+            except vmware.TaskError as e:
+                module.fail_json(msg=e.message, **module.params)
+            if res is False:
+                module.fail_json(msg="Error while creation", cluster=cluster.name, **module.params)
+            module.exit_json(changed=True, rule=rule.show())
+        else:
+            module.exit_json(changed=False, rule=rule.show())
+
+    if module.params['state'] == 'absent':
+        rule = VMWareRule(module.params['name'], content=content)
+        if rule.cluster is None or not rule.exists():
+            module.exit_json(changed=False)
+        else:
+            try:
+                rule.delete()
+            except vim.fault.NoPermission:
+                module.fail_json(msg="permission denied", cluster=cluster.name, **module.params)
+            module.exit_json(changed=True)
+
+    if module.params['state'] == 'list':
+        clusters = vmware.get_all_objs(content,
+                                   [vim.ClusterComputeResource]).keys()
+        facts = []
+        for cluster in clusters:
+            for rule in cluster.configuration.rule:
+                if module.params['name'] is None or module.params['name'] == rule.name:
+                    rule_fact = VMWareRule(rule.name, cluster)
+                    facts.append(rule_fact.show())
+        module.exit_json(changed=False, rules=facts)
+
+if __name__ == '__main__':
+    main()
