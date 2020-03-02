@@ -1,17 +1,100 @@
-#!/usr/bin/python
+#!/usr/bin/env python
+
+ANSIBLE_METADATA = {'metadata_version': '1.2',
+                    'status': ['stableinterface'],
+                    'supported_by': 'Jean-Baptiste Langlois'}
+
+DOCUMENTATION = '''
+---
+module: partition
+short_description: create, resize, list or delete disk partitions
+description:
+    - create, resize, list or delete disk partitions.
+options:
+  disk:
+    description:
+      - disk to partition
+    aliases: ['devices']
+    required: true
+  flags:
+    description:
+      - add partition flags ('raid', 'boot', 'lba', 'swap', 'lvm', 'hidden', 'root', etc.)
+    aliases: ['flag']
+  length:
+    description:
+      - new partition size (in MB). If empty, the remaining space is used.
+    aliases: ['size']
+  name:
+    required: true
+    aliases: ['path']
+    description:
+      - the partition name. optional on list and creation, mandatory on deletion or resize.
+  state:
+    description:
+      - create, resize, list or delete disk partitions
+    required: false
+    default: 'present'
+    choices: ['present', 'absent', 'list']
+  resize:
+    description:
+      - resize an existing partition, rather adding a new one
+    type: bool
+    default: 'no'
+  type:
+    description:
+      - partition types
+    default: 'primary'
+    choices: ['primary', 'logical', 'extended', 'free-space', 'metadata']
+
+author:
+    - "Jean-Baptiste-Langlois (jeanbaptiste.langlois@gmail.com)"
+'''
+
+EXAMPLES = '''
+# Creation a LVM partition to use a full disk
+- partition:
+    device: /dev/sdf
+    path: /dev/sdf1
+    flags: lvm
+    state: present
+
+# Resize an existing partition to 20GB
+- partition:
+    device: /dev/sdf
+    path: /dev/sdf1
+    resize: yes
+    size: 20000
+    state: present
+
+# Delete an existing partition
+- partition:
+    device: /dev/sdf
+    path: /dev/sdf1
+    state: absent
+
+# Create a 2GB extended partition with two logical partition in it
+- partition:
+    device: /dev/sdf
+    size: "{{ item.size }}"
+    type: "{{ item.type }}"
+  loop:
+    - { size: 2000, type: extended }
+    - { size: 1500, type: logical }
+    - { size: 500, type: logical }
+'''
 
 import os
 import json
 import time
 from ansible.module_utils.basic import AnsibleModule
 
-HAS_PYPARTED = False
 try:
     import parted
     import _ped
     HAS_PYPARTED = True
 except ImportError:
-    pass
+    HAS_PYPARTED = False
+
 
 class DiskCommand(object):
     @staticmethod
@@ -27,7 +110,7 @@ class DiskCommand(object):
     @staticmethod
     def flags():
         return {
-            flag: _ped.partition_flag_get_name(flag) for flag in xrange(1, 16)
+            flag: _ped.partition_flag_get_name(flag) for flag in range(1, 16)
         }
 
     def __init__(self, name):
@@ -46,6 +129,7 @@ class DiskCommand(object):
 
     def partition(self, name=None):
         return Partition(self.disk, name)
+
 
 class Partition(object):
     def __init__(self, disk, name=None):
@@ -68,9 +152,11 @@ class Partition(object):
         self.end = partition.geometry.end
         self.length = partition.geometry.length
         self.flags = []
-        self.filesystem = partition.fileSystem.type if partition.fileSystem else None
-        self.type = DiskCommand.types()[partition.type] if partition.type in DiskCommand.types() else "unknown"
-        for f, v in DiskCommand.flags().iteritems():
+        self.filesystem = (partition.fileSystem.type if partition.fileSystem
+                           else None)
+        self.type = (DiskCommand.types()[partition.type]
+                     if partition.type in DiskCommand.types() else "unknown")
+        for f, v in DiskCommand.flags().items():
             if partition.getFlag(f):
                 self.flags.append(v)
 
@@ -102,11 +188,12 @@ class Partition(object):
             start = self.start
         elif partition_type == 'logical':
             if not self.disk.getExtendedPartition():
-                raise _ped.PartitionException('Cannot create logical partition: No extended partition found')
+                raise _ped.PartitionException(
+                    'Cannot create logical partition: No extended partition found')
             start = self.disk.getExtendedPartition().geometry.start + 4 * self.disk.device.sectorSize
             for partition in self.disk.getLogicalPartitions():
                 if start >= partition.geometry.start and start <= partition.geometry.end:
-                    start = partition.geometry.end +  4 * self.disk.device.sectorSize
+                    start = partition.geometry.end + 4 * self.disk.device.sectorSize
         else:
             start = 4 * self.disk.device.sectorSize
             for partition in self.disk.partitions:
@@ -115,9 +202,10 @@ class Partition(object):
                         start = partition.geometry.end + 1
         if length > 0:
             if start + length >= self.disk.device.length:
-                raise _ped.GeometryException('No such disk space left on disk (%d MB on %d MB left)' % (
-                    length * self.disk.device.sectorSize // 1024**2,
-                    (self.disk.device.length - start) * self.disk.device.sectorSize // 1024**2))
+                raise _ped.GeometryException(
+                    'No such disk space left on disk (%d MB on %d MB left)' % (
+                        length * self.disk.device.sectorSize // 1024**2,
+                        (self.disk.device.length - start) * self.disk.device.sectorSize // 1024**2))
             end = start + length
         elif partition_type == 'logical':
             end = self.disk.getExtendedPartition().geometry.end
@@ -170,7 +258,9 @@ class Partition(object):
         if self.disk.device.busy:
             raise _ped.DiskException("Resource is busy: %s" % self.disk.device.path)
         if self.disk.device.length < length:
-            raise _ped.DiskException("The disk size is %d sectors but the 'length' value is %d sectors" % (self.disk.device.length, length))
+            raise _ped.DiskException(
+                "The disk size is %d sectors but the 'length' value is %d sectors" % (
+                    self.disk.device.length, length))
         if abs(self.length - length) < 2:
             return False
         if length != 0 and length < self.length - 1:
@@ -211,19 +301,23 @@ class Partition(object):
         if self.disk.device.busy:
             raise _ped.DiskException("Resource is busy: %s" % self.disk.device.path)
         if self.disk.device.length < length:
-            raise _ped.DiskException("The disk size is %d sectors but the 'length' value is %d sectors" % (self.disk.device.length, length))
+            raise _ped.DiskException(
+                "The disk size is %d sectors but the 'length' value is %d sectors" % (
+                    self.disk.device.length, length))
         geom = self._compute_geometry(length, partition_type)
         constraint = parted.Constraint(startAlign=self.disk.device.optimumAlignment,
                                        endAlign=self.disk.device.optimumAlignment,
                                        device=self.disk.device)
-        for f, v in DiskCommand.types().iteritems():
+        for f, v in DiskCommand.types().items():
             if partition_type == v:
                 ptype = f
                 break
         else:
             raise _ped.UnknownTypeException('Partition type: %s' % partition_type)
         new_partition = parted.Partition(disk=self.disk, type=ptype, geometry=geom)
-        pflags = [key for flag in flags for key, val in DiskCommand.flags().iteritems() if val == flag]
+        pflags = [key for flag in flags
+                  for key, val in DiskCommand.flags().items()
+                  if val == flag]
         for pf in pflags:
             new_partition.setFlag(pf)
         self.update(new_partition)
@@ -245,17 +339,18 @@ class Partition(object):
                 raise _ped.IOException('Changes could not be commited')
         return True
 
+
 def main():
-    module = AnsibleModule(argument_spec = dict(
-            disk = dict(required=True, aliases=['device']),
-            flags = dict(required=False, type='list', aliases=['flag'], default=[]),
-            length = dict(required=False, type='int', aliases=['size']),
-            name = dict(required=False, aliases=['path']),
-            state = dict(required=False, default='present', choices=['absent', 'present', 'list']),
-            resize = dict(required=False, type='bool', default=False),
-            type = dict(required=False, default='primary', choices=DiskCommand.types().values())
+    module = AnsibleModule(argument_spec=dict(
+            disk=dict(required=True, aliases=['device']),
+            flags=dict(required=False, type='list', aliases=['flag'], default=[]),
+            length=dict(required=False, type='int', aliases=['size']),
+            name=dict(required=False, aliases=['path']),
+            state=dict(required=False, default='present', choices=['absent', 'present', 'list']),
+            resize=dict(required=False, type='bool', default=False),
+            type=dict(required=False, default='primary', choices=DiskCommand.types().values())
         ),
-        required_if = [
+        required_if=[
             ['state', 'absent', ['name']],
             ['resize', True, ['name']],
         ],
@@ -280,8 +375,10 @@ def main():
     if param_flags:
         for flag in param_flags:
             if flag not in DiskCommand.flags().values():
-                module.fail_json(changed=False, msg="value of flags must be one of: %s, got: %s" % (','.join(DiskCommand.flags().values()), flag))
-
+                module.fail_json(
+                    changed=False,
+                    msg="value of flags must be one of: %s, got: %s" % (','.join(
+                        DiskCommand.flags().values()), flag))
 
     try:
         dc = DiskCommand(param_disk)
@@ -342,6 +439,7 @@ def main():
         except Exception as e:
             module.fail_json(changed=False, msg=str(e))
         module.exit_json(changed=True)
+
 
 if __name__ == '__main__':
     main()
