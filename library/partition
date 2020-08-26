@@ -348,7 +348,7 @@ def main():
             name=dict(required=False, aliases=['path']),
             state=dict(required=False, default='present', choices=['absent', 'present', 'list']),
             resize=dict(required=False, type='bool', default=False),
-            type=dict(required=False, default='primary', choices=DiskCommand.types().values())
+            type=dict(required=False, default='primary', choices=list(DiskCommand.types().values()))
         ),
         required_if=[
             ['state', 'absent', ['name']],
